@@ -82,6 +82,13 @@ impl AncillaryData {
         }
     }
 
+    /// Exposes the raw EVENT_RECORD pointer for TDH decoding.
+    /// Returns None if no event is currently being processed.
+    pub fn raw_event_record(&self) -> Option<*const EVENT_RECORD> {
+        self.event
+    }
+
+
     pub fn time(&self) -> u64 {
         match self.event {
             Some(event) => {
