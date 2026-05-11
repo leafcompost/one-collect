@@ -1,0 +1,8 @@
+0x7a231c4c0020 c49 instance bool [System.Private.CoreLib] System.IO.Enumeration.FileSystemEnumerator`1[System.__Canon]::MoveNext()[OptimizedTier1]
+0x7a231c4c0cb0 4 instance valuetype OpenTelemetry.Metrics.MetricPointStatus [OpenTelemetry] OpenTelemetry.Metrics.MetricPoint::get_MetricPointStatus()[OptimizedTier1]
+rs.HeaderDescriptor,string)[InstrumentedTierOptimized]
+7402ec4bb340 1668 JS:*'parserOnIncoming node:_http_server:1084:26
+del.Protocols.OpenIdConnect.OpenIdProviderMetadataUtf8Bytes::get_SubjectTypesSupported()[InstrumentedTier]
+7402ec4bca40 11e0 JS:*'write_ node:_http_outgoing:887:16
+0X7402EC2F8640 250 JS:+ node:internal/deps/undici/undici:3179:40
+

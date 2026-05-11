@@ -423,7 +423,7 @@ impl PerfMapSymbolReader {
     }
 
     fn load_next(&mut self) {
-        'load: {
+        loop {
             self.buffer.clear();
 
             self.start_ip = 0;
@@ -433,43 +433,59 @@ impl PerfMapSymbolReader {
             if let Ok(len) = self.reader.read_line(&mut self.buffer) {
                 if len == 0 {
                     trace!("PerfMap load_next: end of file");
-                    break 'load;
+                    break;
                 }
             } else {
                 trace!("PerfMap load_next: read error");
-                break 'load;
+                break;
             }
 
             trace!("PerfMap load_next: parsing line={}", self.buffer.trim());
 
-            for (index, part) in self.buffer.splitn(3, ' ').enumerate() {
-                match index {
-                    0 => {
-                        if part.starts_with("0x") || part.starts_with("0X") {
-                            self.start_ip = u64::from_str_radix(&part[2..], 16).unwrap();
-                        } else {
-                            self.start_ip = u64::from_str_radix(part, 16).unwrap();
-                        }
-                    },
-                    1 => {
-                        let size = u64::from_str_radix(part, 16).unwrap();
-                        self.end_ip = self.start_ip + size;
-                    },
-                    _ => {
-                        /*
-                         * Symbols sometimes have nulls in them. When we see
-                         * this we'll just use up to the null as the name.
-                         */
-                        let part = part.split('\0').next().unwrap();
+            let mut parts = self.buffer.splitn(3, ' ');
 
-                        self.name.push_str(part);
-                        if self.name.ends_with("\n") {
-                            self.name.pop();
-                        }
-                        if self.name.ends_with("\r") {
-                            self.name.pop();
-                        }
-                    },
+            let Some(start_str) = parts.next() else {
+                continue;
+            };
+
+            let start_str = if start_str.starts_with("0x") || start_str.starts_with("0X") {
+                &start_str[2..]
+            } else {
+                start_str
+            };
+
+            self.start_ip = match u64::from_str_radix(start_str, 16) {
+                Ok(start_ip) => start_ip,
+                Err(_) => {
+                    warn!("PerfMap load_next: skipping malformed line={}", self.buffer.trim());
+                    continue;
+                }
+            };
+
+            let Some(size_str) = parts.next() else {
+                continue;
+            };
+
+            let Ok(size) = u64::from_str_radix(size_str, 16) else {
+                warn!("PerfMap load_next: skipping malformed line={}", self.buffer.trim());
+                continue;
+            };
+
+            self.end_ip = self.start_ip + size;
+
+            if let Some(name_part) = parts.next() {
+                /*
+                 * Symbols sometimes have nulls in them. When we see
+                 * this we'll just use up to the null as the name.
+                 */
+                let name_part = name_part.split('\0').next().unwrap();
+
+                self.name.push_str(name_part);
+                if self.name.ends_with("\n") {
+                    self.name.pop();
+                }
+                if self.name.ends_with("\r") {
+                    self.name.pop();
                 }
             }
 
@@ -985,5 +1001,51 @@ mod tests {
         assert!(map.seen_range(1024, 4096));
         assert!(map.seen_range(1279, 1279));
         assert!(!map.seen_range(1280, 4096));
+    }
+
+    #[test]
+    fn perf_map_skips_malformed_lines() {
+        let perf_map_path = std::env::current_dir().unwrap().join(
+            "../test/assets/perfmap/malformed-lines.map");
+
+        let file = File::open(perf_map_path).expect("Unable to open test file");
+        let mut reader = PerfMapSymbolReader::new(file);
+        reader.reset();
+
+        // 0x-prefixed .NET symbol
+        assert!(reader.next());
+        assert_eq!(0x7a231c4c0020, reader.start());
+        assert_eq!(0x7a231c4c0020 + 0xc49, reader.end());
+        assert_eq!(reader.name(), "instance bool [System.Private.CoreLib] System.IO.Enumeration.FileSystemEnumerator`1[System.__Canon]::MoveNext()[OptimizedTier1]");
+
+        // 0x-prefixed .NET symbol
+        assert!(reader.next());
+        assert_eq!(0x7a231c4c0cb0, reader.start());
+        assert_eq!(0x7a231c4c0cb0 + 0x4, reader.end());
+
+        // Malformed line "rs.HeaderDescriptor,string)..." is skipped
+
+        // Plain hex JS symbol
+        assert!(reader.next());
+        assert_eq!(0x7402ec4bb340, reader.start());
+        assert_eq!(0x7402ec4bb340 + 0x1668, reader.end());
+        assert_eq!(reader.name(), "JS:*'parserOnIncoming node:_http_server:1084:26");
+
+        // Malformed line "del.Protocols.OpenIdConnect..." is skipped
+
+        // Plain hex JS symbol
+        assert!(reader.next());
+        assert_eq!(0x7402ec4bca40, reader.start());
+        assert_eq!(0x7402ec4bca40 + 0x11e0, reader.end());
+        assert_eq!(reader.name(), "JS:*'write_ node:_http_outgoing:887:16");
+
+        // 0X-prefixed (uppercase) JS symbol
+        assert!(reader.next());
+        assert_eq!(0x7402EC2F8640, reader.start());
+        assert_eq!(0x7402EC2F8640 + 0x250, reader.end());
+        assert_eq!(reader.name(), "JS:+ node:internal/deps/undici/undici:3179:40");
+
+        // End of file
+        assert!(!reader.next());
     }
 }
