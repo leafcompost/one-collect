@@ -224,7 +224,7 @@ impl ExportMapping {
                     },
                     Err(i) => {
                         let addr = *unique_ips.get(i).unwrap_or(&0u64);
-                        if unique_ips.len() > i && addr < end_ip {
+                        if unique_ips.len() > i && addr <= end_ip {
                             add_sym = true;
                         }
                     }
@@ -501,8 +501,11 @@ mod tests {
             
             // Symbol 5: file 1700-1800 -> VA 4772-4872
             (1700, 1800, "symbol_middle_4".to_string()),
-            
-            // Symbol 6: file 4900-5020 -> VA 7972-8092 (near end of mapping)
+
+            // Symbol 6: file 1828-1927 -> VA 4900-4999.
+            (1828, 1927, "symbol_at_end".to_string()),
+
+            // Symbol 7: file 4900-5020 -> VA 7972-8092 (near end of mapping)
             (4900, 5020, "symbol_near_end".to_string()),
             
             // Symbol that shouldn't match (outside mapping range)
@@ -539,7 +542,10 @@ mod tests {
             4872,  // End of symbol_middle_4
             7972,  // Start of symbol_near_end
             8092,  // End of symbol_near_end
-            
+
+            // symbol_at_end (4900-4999), is only reachable via its last byte.
+            4999,
+
             // Test non-matching IPs
             4200,  // Between symbols
             8500,  // Beyond all symbols
@@ -548,8 +554,8 @@ mod tests {
         // Call the function being tested
         mapping.add_matching_symbols(&mut unique_ips, &mut sym_reader, &mut strings);
 
-        // Verify results - should have 6 matching symbols
-        assert_eq!(6, mapping.symbols().len(), "Should have added 6 symbols");
+        // Verify results - should have 7 matching symbols
+        assert_eq!(7, mapping.symbols().len(), "Should have added 7 symbols");
         
         // Verify that reset was called on the reader
         assert!(sym_reader.reset_called, "Expected reset() to be called");
@@ -564,6 +570,7 @@ mod tests {
             ("symbol_middle_2", 4372, 4472),
             ("symbol_middle_3", 4572, 4672),
             ("symbol_middle_4", 4772, 4872),
+            ("symbol_at_end", 4900, 4999),
             ("symbol_near_end", 7972, 8092),
         ];
 

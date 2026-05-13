@@ -209,8 +209,18 @@ impl FrameOffset {
             cfa_data.off = state.cfa_off;
 
             for reg_state in &state.reg_states {
-                if reg_state.reg >= max_reg || 
-                   reg_state.val_type != VALUE_TYPE_OFFSET {
+                if reg_state.reg >= max_reg {
+                    continue;
+                }
+
+                // Undefined means the register has no recoverable value in the previous frame, so
+                // clear any offset rule.
+                if reg_state.val_type == VALUE_TYPE_UNDEFINED {
+                    cfa_data.off_mask &= !(1 << reg_state.reg as u64);
+                    continue;
+                }
+
+                if reg_state.val_type != VALUE_TYPE_OFFSET {
                     continue;
                 }
 
