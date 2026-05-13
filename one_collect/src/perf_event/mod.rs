@@ -854,9 +854,12 @@ impl PerfSession {
                 /* PERF_SAMPLE_RAW */
                 if perf_data.has_format(abi::PERF_SAMPLE_RAW) {
                     let size = perf_data.read_u32(offset)? as usize;
+                    let raw_field_size = 4 + size;
+                    let raw_field_aligned_size = (raw_field_size + 7) & !7;
                     offset += 4;
                     id = Some(perf_data.read_u16(offset)? as usize);
                     offset += self.raw_field.update(offset, size);
+                    offset += raw_field_aligned_size - raw_field_size;
                 } else {
                     self.raw_field.reset();
                 }
@@ -1537,5 +1540,69 @@ mod tests {
 
         /* Ensure we only saw 1 event and our assert checks ran */
         assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mock_data_perf_session_raw_aligned_with_following_cpu() {
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let sample_format =
+            abi::PERF_SAMPLE_RAW |
+            abi::PERF_SAMPLE_CPU;
+
+        let mut mock = MockData::new(sample_format, 0);
+        let mut perf_data = Vec::new();
+        let mut raw_data = Vec::new();
+        let mut event_data = Vec::new();
+
+        let id: u16 = 1;
+        let marker: u8 = 0xAB;
+        let cpu: u32 = 7;
+
+        event_data.extend_from_slice(&id.to_ne_bytes());
+        event_data.push(marker);
+
+        /* PERF_SAMPLE_CPU (u32 cpu + u32 reserved) */
+        raw_data.extend_from_slice(&cpu.to_ne_bytes());
+        raw_data.extend_from_slice(&0u32.to_ne_bytes());
+
+        /* PERF_SAMPLE_RAW data field with alignment padding */
+        Sample::write_raw(event_data.as_slice(), &mut raw_data);
+        assert_eq!(16, raw_data.len());
+
+        Header::write(abi::PERF_RECORD_SAMPLE, 0, raw_data.as_slice(), &mut perf_data);
+        mock.push(perf_data.as_slice());
+
+        let mut session = PerfSession::new(Box::new(mock));
+
+        let mut e = Event::new(id as usize, "test".into());
+        let format = e.format_mut();
+        format.add_field(
+            EventField::new(
+                "common_type".into(), "unsigned short".into(),
+                LocationType::Static, 0, 2));
+        format.add_field(
+            EventField::new(
+                "marker".into(), "unsigned char".into(),
+                LocationType::Static, 2, 1));
+
+        let cpu_data = session.cpu_data_ref();
+        let callback_count = Arc::clone(&count);
+        let marker_ref = format.get_field_ref("marker").unwrap();
+
+        e.add_callback(move |data| {
+            let read_marker = data.format().get_data(marker_ref, data.event_data());
+            let read_cpu = cpu_data.try_get_u32(data.full_data()).unwrap();
+
+            assert_eq!(marker, read_marker[0]);
+            assert_eq!(cpu, read_cpu);
+
+            callback_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+        session.add_event(e).unwrap();
+        session.parse_all().unwrap();
+        assert_eq!(1, count.load(Ordering::Relaxed));
     }
 }

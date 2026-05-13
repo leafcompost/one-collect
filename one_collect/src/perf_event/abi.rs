@@ -343,9 +343,16 @@ impl Sample {
         data: &[u8],
         output: &mut Vec<u8>) {
         let len = data.len() as u32;
+        let field_size = 4 + data.len();
+        let aligned_field_size = (field_size + 7) & !7;
 
         output.extend_from_slice(&len.to_ne_bytes());
         output.extend_from_slice(data);
+
+        let padding = aligned_field_size - field_size;
+        if padding > 0 {
+            output.resize(output.len() + padding, 0);
+        }
     }
 }
 
@@ -374,5 +381,17 @@ mod tests {
         assert_eq!(1234, u32::from_ne_bytes(magic_slice));
 
         assert_eq!([0u8; 4], data_slice[4..8]);
+    }
+
+    #[test]
+    fn sample_raw_aligned() {
+        let mut data = Vec::new();
+
+        Sample::write_raw(&[1u8, 2u8, 3u8], &mut data);
+
+        assert_eq!(8, data.len());
+        assert_eq!(3u32.to_ne_bytes(), data[0..4]);
+        assert_eq!([1u8, 2u8, 3u8], data[4..7]);
+        assert_eq!(0u8, data[7]);
     }
 }
