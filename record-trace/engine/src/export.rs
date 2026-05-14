@@ -267,17 +267,26 @@ impl NetTraceExporter {
     fn validate_output_file_path(output_path: &PathBuf) -> anyhow::Result<()> {
         if output_path.exists() && output_path.is_dir() {
             warn!("NetTrace export path is a directory: path={}", output_path.display());
-            return Err(anyhow!("{} is a directory.", output_path.display()));
+            return Err(anyhow!(
+                "The output path {} is a directory. Please provide a file path (for example, trace.nettrace).",
+                output_path.display()
+            ));
         }
 
         if let Some(parent) = output_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             if !parent.exists() {
                 warn!("NetTrace export parent path does not exist: path={}", parent.display());
-                return Err(anyhow!("{} does not exist.", parent.display()));
+                return Err(anyhow!(
+                    "The output directory {} does not exist. Please create it and try again.",
+                    parent.display()
+                ));
             }
             else if !parent.is_dir() {
                 warn!("NetTrace export parent path is not a directory: path={}", parent.display());
-                return Err(anyhow!("{} is not a directory.", parent.display()));
+                return Err(anyhow!(
+                    "The output directory {} is not a directory. Please provide a valid output directory and try again.",
+                    parent.display()
+                ));
             }
         }
 
@@ -387,6 +396,6 @@ mod tests {
         let result = exporter.validate(&args);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
+        assert!(result.unwrap_err().to_string().contains("Please create it and try again"));
     }
 }
