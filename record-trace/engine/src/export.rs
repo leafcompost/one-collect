@@ -284,7 +284,7 @@ impl NetTraceExporter {
             else if !parent.is_dir() {
                 warn!("NetTrace export parent path is not a directory: path={}", parent.display());
                 return Err(anyhow!(
-                    "The output directory {} is not a directory. Please provide a valid output directory and try again.",
+                    "The parent path {} exists but is not a directory. Please provide a path with a valid directory as the parent.",
                     parent.display()
                 ));
             }
