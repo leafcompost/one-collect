@@ -11,6 +11,7 @@ use one_collect::helpers::exporting::process::MetricValue;
 
 use crate::commandline::RecordArgs;
 use anyhow::anyhow;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 pub (crate) trait Exporter {
@@ -252,27 +253,78 @@ impl NetTraceExporter {
             output_path: PathBuf::new(),
         }
     }
+
+    fn resolve_output_path(output_path: &PathBuf) -> PathBuf {
+        if output_path.exists() && output_path.is_dir() {
+            debug!("Using default output filename: trace.nettrace");
+            output_path.join("trace.nettrace")
+        }
+        else {
+            output_path.to_owned()
+        }
+    }
+
+    fn validate_output_file_path(output_path: &PathBuf) -> anyhow::Result<()> {
+        if output_path.exists() && output_path.is_dir() {
+            warn!("NetTrace export path is a directory: path={}", output_path.display());
+            return Err(anyhow!(
+                "The output path {} is a directory. Please provide a file path (for example, trace.nettrace).",
+                output_path.display()
+            ));
+        }
+
+        if let Some(parent) = output_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            if !parent.exists() {
+                warn!("NetTrace export parent path does not exist: path={}", parent.display());
+                return Err(anyhow!(
+                    "The output directory {} does not exist. Please create it and try again.",
+                    parent.display()
+                ));
+            }
+            else if !parent.is_dir() {
+                warn!("NetTrace export parent path is not a directory: path={}", parent.display());
+                return Err(anyhow!(
+                    "The parent path {} exists but is not a directory. Please provide a path with a valid directory as the parent.",
+                    parent.display()
+                ));
+            }
+        }
+
+        let output_exists = output_path.exists();
+        let open_result = if output_exists {
+            OpenOptions::new()
+                .write(true)
+                .open(output_path)
+        }
+        else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output_path)
+        };
+
+        match open_result {
+            Ok(_) => {
+                if !output_exists {
+                    std::fs::remove_file(output_path)?;
+                }
+
+                Ok(())
+            },
+            Err(error) => {
+                warn!("NetTrace export path is not writable: path={}, error={}", output_path.display(), error);
+                Err(anyhow!("{} is not writable: {}", output_path.display(), error))
+            },
+        }
+    }
 }
 
 impl Exporter for NetTraceExporter {
     fn validate(
         &mut self,
         args: &RecordArgs) -> anyhow::Result<()> {
-        let output_path = args.output_path();
-        self.output_path.push(args.output_path());
-
-        if output_path.exists() && output_path.is_dir() {
-            if let Some(extension) = output_path.extension() {
-                if extension == "nettrace" {
-                    warn!("NetTrace export path is a directory: path={}", output_path.display());
-                    return Err(anyhow!("{} is a directory.", output_path.display()));
-                }
-            }
-            else {
-                debug!("Using default output filename: trace.nettrace");
-                self.output_path.push("trace.nettrace");
-            }
-        }
+        self.output_path = Self::resolve_output_path(args.output_path());
+        Self::validate_output_file_path(&self.output_path)?;
 
         Ok(())
     }
@@ -289,5 +341,61 @@ impl Exporter for NetTraceExporter {
         info!("NetTrace export completed successfully");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time should be after unix epoch")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("record-trace-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn nettrace_directory_path_with_extension_uses_default_filename() {
+        let out_dir = unique_temp_path("out-dir");
+        let out_dir_with_extension = out_dir.with_extension("data");
+        std::fs::create_dir_all(&out_dir_with_extension).expect("Temp output directory should be created");
+
+        let mut exporter = NetTraceExporter::new();
+        let args = RecordArgs::parse([
+            "record-trace",
+            "--on-cpu",
+            "--out",
+            &out_dir_with_extension.to_string_lossy(),
+        ]);
+
+        let result = exporter.validate(&args);
+
+        std::fs::remove_dir_all(out_dir_with_extension).expect("Temp output directory should be removed");
+
+        assert!(result.is_ok());
+        assert!(exporter.output_path.ends_with("trace.nettrace"));
+    }
+
+    #[test]
+    fn nettrace_missing_parent_path_fails_validation() {
+        let missing_parent = unique_temp_path("missing-parent");
+        let out_file = missing_parent.join("trace.nettrace");
+
+        let mut exporter = NetTraceExporter::new();
+        let args = RecordArgs::parse([
+            "record-trace",
+            "--on-cpu",
+            "--out",
+            &out_file.to_string_lossy(),
+        ]);
+
+        let result = exporter.validate(&args);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Please create it and try again"));
     }
 }

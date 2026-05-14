@@ -3,6 +3,12 @@
 
 use std::array::TryFromSliceError;
 
+pub const PERF_RECORD_ALIGNMENT: usize = 8;
+
+pub fn align_to_perf_record(size: usize) -> usize {
+    (size + (PERF_RECORD_ALIGNMENT - 1)) & !(PERF_RECORD_ALIGNMENT - 1)
+}
+
 // Current possible sample layout:
 // u64    id;          /* if PERF_SAMPLE_IDENTIFIER */
 // u64    ip;          /* if PERF_SAMPLE_IP */
@@ -314,12 +320,18 @@ impl<'a> Header<'a> {
         misc: u16,
         data: &[u8],
         output: &mut Vec<u8>) {
-        /* Account for header itself */
-        let size = (data.len() + 8) as u16;
+        /* Account for the header itself, then align records to 8-byte boundaries. */
+        let unaligned_size = data.len() + 8;
+        let size = align_to_perf_record(unaligned_size) as u16;
         output.extend_from_slice(&entry_type.to_ne_bytes());
         output.extend_from_slice(&misc.to_ne_bytes());
         output.extend_from_slice(&size.to_ne_bytes());
         output.extend_from_slice(data);
+
+        let padding = (size as usize) - unaligned_size;
+        if padding > 0 {
+            output.resize(output.len() + padding, 0);
+        }
     }
 }
 
@@ -331,15 +343,6 @@ impl Sample {
         time: u64,
         output: &mut Vec<u8>) {
         output.extend_from_slice(&time.to_ne_bytes());
-    }
-
-    pub fn write_raw(
-        data: &[u8],
-        output: &mut Vec<u8>) {
-        let len = data.len() as u32;
-
-        output.extend_from_slice(&len.to_ne_bytes());
-        output.extend_from_slice(data);
     }
 }
 
@@ -361,10 +364,33 @@ mod tests {
 
         assert_eq!(1024, header.entry_type);
         assert_eq!(0, header.misc);
-        assert_eq!(12, header.size);
+        assert_eq!(16, header.size);
 
         let data_slice = header.data;
         let magic_slice = data_slice[0..4].try_into().unwrap();
         assert_eq!(1234, u32::from_ne_bytes(magic_slice));
+
+        assert_eq!([0u8; 4], data_slice[4..8]);
+    }
+
+    #[test]
+    fn sample_raw_aligned() {
+        let mut data = Vec::new();
+        let raw = [1u8, 2u8, 3u8];
+        let len = raw.len() as u32;
+        let field_size = 4 + raw.len();
+        let aligned_field_size = align_to_perf_record(field_size);
+        let padding = aligned_field_size - field_size;
+
+        data.extend_from_slice(&len.to_ne_bytes());
+        data.extend_from_slice(&raw);
+        if padding > 0 {
+            data.resize(data.len() + padding, 0);
+        }
+
+        assert_eq!(8, data.len());
+        assert_eq!(3u32.to_ne_bytes(), data[0..4]);
+        assert_eq!([1u8, 2u8, 3u8], data[4..7]);
+        assert_eq!(0u8, data[7]);
     }
 }

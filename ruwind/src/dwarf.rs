@@ -172,6 +172,7 @@ impl FrameOptions {
 pub struct FrameOffset {
     pub rva: u64,
     pub fde: u64,
+    pub pc_size: u64,
     state: u8,
     ret_reg: u8,
     frame_states: Vec<FrameState>,
@@ -184,6 +185,7 @@ impl FrameOffset {
         Self {
             rva,
             fde,
+            pc_size: 0,
             state: STATE_UNPARSED,
             ret_reg: 0,
             frame_states: Vec::new(),
@@ -207,8 +209,18 @@ impl FrameOffset {
             cfa_data.off = state.cfa_off;
 
             for reg_state in &state.reg_states {
-                if reg_state.reg >= max_reg || 
-                   reg_state.val_type != VALUE_TYPE_OFFSET {
+                if reg_state.reg >= max_reg {
+                    continue;
+                }
+
+                // Undefined means the register has no recoverable value in the previous frame, so
+                // clear any offset rule.
+                if reg_state.val_type == VALUE_TYPE_UNDEFINED {
+                    cfa_data.off_mask &= !(1 << reg_state.reg as u64);
+                    continue;
+                }
+
+                if reg_state.val_type != VALUE_TYPE_OFFSET {
                     continue;
                 }
 
@@ -405,7 +417,8 @@ impl FrameOffset {
 
         let mut cursor: usize = 8;
         let pc_start = read_value(options.enc, self.fde as i64, fde_slice, &mut cursor)?;
-        let _pc_size = read_value(options.enc, -12, fde_slice, &mut cursor)?;
+        let pc_size = read_value(options.enc, -12, fde_slice, &mut cursor)?;
+        self.pc_size = pc_size as u64;
 
         if options.has_aug_data {
             /* Skip augmentation data */
