@@ -24,6 +24,27 @@ tracing = "0.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55.0"
 
+# windows-sys is intentionally NOT gated to `cfg(target_os = "windows")`.
+# The `etw` module is gated by `cfg(any(doc, target_os = "windows"))` in
+# lib.rs, so rustdoc (which sets `cfg(doc)`) compiles it on every target
+# including Linux; the `pub use windows_sys::…` re-exports in `etw/abi.rs`
+# need the crate to be resolvable there too. On non-Windows targets
+# windows-sys compiles to a no-op at lib build time (type definitions only;
+# link directives don't fire until an executable is built), and because
+# nothing in the Linux code paths references windows-sys symbols the
+# linker drops it entirely — no impact on the Linux binary size.
+#
+# Version tracks what winreg resolves to (currently 0.59); bump in lockstep.
+#
+# Cargo unifies features additively across the dep graph, so the actual
+# windows-sys compilation also includes the features winreg enables (e.g.
+# Win32_System_Registry). We deliberately list only the features `etw/`
+# uses directly, so this manifest documents our own surface rather than
+# transitively inherited features.
+[dependencies.windows-sys]
+version = "0.59"
+features = ["Win32_System_Diagnostics_Etw"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.153"
 
