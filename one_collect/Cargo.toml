@@ -24,6 +24,18 @@ tracing = "0.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55.0"
 
+# windows-sys version tracks what winreg resolves to (currently 0.59); bump in
+# lockstep.
+#
+# Cargo unifies features additively across the dep graph, so the actual
+# windows-sys compilation also includes the features winreg enables (e.g.
+# Win32_System_Registry). We deliberately list only the features `etw/`
+# uses directly, so this manifest documents our own surface rather than
+# transitively inherited features.
+[target.'cfg(target_os = "windows")'.dependencies.windows-sys]
+version = "0.59"
+features = ["Win32_System_Diagnostics_Etw"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.153"
 
