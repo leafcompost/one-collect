@@ -15,11 +15,15 @@ use crate::Guid;
 #[allow(dead_code)]
 mod abi;
 mod events;
+pub mod tdh;
+
+/// Re-export `EVENT_RECORD` so consumers of `TdhDecoder` can name the
+/// type without reaching into `abi` (which is `pub(crate)`).
+pub use abi::EVENT_RECORD;
 
 use abi::{
     TraceSession,
     TraceEnable,
-    EVENT_RECORD,
     EVENT_HEADER_EXTENDED_DATA_ITEM,
     CLASSIC_EVENT_ID,
     EventRecordExt,

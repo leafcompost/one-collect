@@ -523,6 +523,9 @@ const _: () = assert!(
 impl EventRecordExt for EVENT_RECORD {
     #[inline]
     fn user_data_slice(&self) -> &[u8] {
+        if self.UserData.is_null() || self.UserDataLength == 0 {
+            return &[];
+        }
         unsafe {
             std::slice::from_raw_parts(
                 self.UserData as *const u8,
