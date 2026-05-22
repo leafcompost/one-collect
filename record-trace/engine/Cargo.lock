@@ -481,6 +481,7 @@ dependencies = [
  "sha1",
  "tracing",
  "twox-hash",
+ "windows-sys 0.59.0",
  "winreg",
 ]
 

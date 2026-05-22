@@ -463,65 +463,95 @@ impl Default for ENABLE_TRACE_PARAMETERS {
     }
 }
 
-#[repr(C)]
-#[allow(non_snake_case)]
-pub struct EVENT_DESCRIPTOR {
-    pub Id: u16,
-    pub Version: u8,
-    pub Channel: u8,
-    pub Level: u8,
-    pub Opcode: u8,
-    pub Task: u16,
-    pub Keyword: u64,
+// The four ETW types that surface on the crate's public API
+// (`AncillaryData::record()` returns a `&EVENT_RECORD`, and the upcoming
+// `TdhDecoder` will take one) come from `windows-sys` so consumers and the
+// decoder share a single type identity. The rest of this file's ETW
+// surface (`EVENT_TRACE_PROPERTIES`, `WNODE_HEADER`, `ENABLE_TRACE_PARAMETERS`,
+// the extern entry points, etc.) is internal-only and stays hand-rolled
+// to keep the migration localized.
+pub use windows_sys::Win32::System::Diagnostics::Etw::{
+    EVENT_HEADER_EXTENDED_DATA_ITEM,
+    EVENT_RECORD,
+};
+
+/// Extension trait providing the few ergonomic accessors the rest of the
+/// `etw` module needs on `EVENT_RECORD`. `EVENT_RECORD` is a foreign type
+/// now, so inherent methods aren't allowed; importing `EventRecordExt`
+/// preserves call-site syntax like `record.user_data_slice()`. Crate-
+/// internal only — external consumers receive `&EVENT_RECORD` and hand it
+/// to the decoder, they never need these accessors themselves.
+pub(crate) trait EventRecordExt {
+    fn user_data_slice(&self) -> &[u8];
+    fn processor_index(&self) -> u16;
+    fn provider_guid(&self) -> Guid;
+    fn activity_guid(&self) -> Guid;
 }
 
-#[repr(C)]
-#[allow(non_snake_case)]
-pub struct EVENT_HEADER {
-    pub Size: u16,
-    pub HeaderType: u16,
-    pub Flags: u16,
-    pub EventProperty: u16,
-    pub ThreadId: u32,
-    pub ProcessId: u32,
-    pub TimeStamp: u64,
-    pub ProviderId: Guid,
-    pub EventDescriptor: EVENT_DESCRIPTOR,
-    pub KernelTime: u32,
-    pub UserTime: u32,
-    pub ActivityId: Guid,
-}
+// SAFETY guard for the `provider_guid` / `activity_guid` transmutes below.
+// `mem::transmute` already enforces same size at compile time, but spelling
+// the assumption out gives a clear error message if a future `windows-sys`
+// bump ever changes the `GUID` layout.
+const _: () = assert!(
+    std::mem::size_of::<Guid>() == std::mem::size_of::<windows_sys::core::GUID>(),
+    "Guid and windows_sys::core::GUID must have identical size",
+);
+const _: () = assert!(
+    std::mem::align_of::<Guid>() == std::mem::align_of::<windows_sys::core::GUID>(),
+    "Guid and windows_sys::core::GUID must have identical alignment",
+);
 
-#[repr(C)]
-#[allow(non_snake_case)]
-pub struct EVENT_HEADER_EXTENDED_DATA_ITEM {
-    pub Reserved1: u16,
-    pub ExtType: u16,
-    pub Linkage: u16,
-    pub DataSize: u16,
-    pub DataPtr: *const u8,
-}
+// SAFETY guard for the `processor_index` union read below. The
+// `BufferContext.Anonymous` union has two arms (`ProcessorIndex: u16` and
+// a packed `{ProcessorNumber: u8, Alignment: u8}`) that both occupy the
+// same two bytes. If `windows-sys` ever grows the union to a third, larger
+// variant or marks it `#[repr(packed)]`, our `u16` read would silently
+// miss bytes or become unaligned; catch either at build time instead.
+const _: () = assert!(
+    std::mem::size_of::<
+        windows_sys::Win32::System::Diagnostics::Etw::ETW_BUFFER_CONTEXT_0
+    >() == 2,
+    "ETW_BUFFER_CONTEXT_0 union must remain 2 bytes",
+);
+const _: () = assert!(
+    std::mem::align_of::<
+        windows_sys::Win32::System::Diagnostics::Etw::ETW_BUFFER_CONTEXT_0
+    >() >= std::mem::align_of::<u16>(),
+    "ETW_BUFFER_CONTEXT_0 union must be at least u16-aligned",
+);
 
-#[repr(C)]
-#[allow(non_snake_case)]
-pub struct EVENT_RECORD {
-    pub EventHeader: EVENT_HEADER,
-    pub ProcessorIndex: u16,
-    pub LoggerId: u16,
-    pub ExtendedDataCount: u16,
-    pub UserDataLength: u16,
-    pub ExtendedData: *const EVENT_HEADER_EXTENDED_DATA_ITEM,
-    pub UserData: *const u8,
-    pub UserContext: *const std::ffi::c_void,
-}
-
-impl EVENT_RECORD {
-    pub fn user_data_slice(&self) -> &[u8] {
+impl EventRecordExt for EVENT_RECORD {
+    #[inline]
+    fn user_data_slice(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
-                self.UserData,
+                self.UserData as *const u8,
                 self.UserDataLength as usize)
         }
+    }
+
+    #[inline]
+    fn processor_index(&self) -> u16 {
+        // SAFETY: `BufferContext.Anonymous` is a union whose two arms
+        // (`ProcessorIndex: u16` and `{ProcessorNumber: u8, Alignment: u8}`)
+        // alias the same two bytes; either arm always contains a valid
+        // bit-pattern for a `u16`. The const assertion above guards the
+        // 2-byte size against future `windows-sys` layout drift.
+        unsafe { self.BufferContext.Anonymous.ProcessorIndex }
+    }
+
+    #[inline]
+    fn provider_guid(&self) -> Guid {
+        // SAFETY: `Guid` and `windows_sys::core::GUID` are both `#[repr(C)]`
+        // with identical field order, widths, and (asserted above) size and
+        // alignment, so a bit-for-bit transmute is sound.
+        unsafe { std::mem::transmute(self.EventHeader.ProviderId) }
+    }
+
+    #[inline]
+    fn activity_guid(&self) -> Guid {
+        // SAFETY: see `provider_guid` above.
+        unsafe { std::mem::transmute(self.EventHeader.ActivityId) }
     }
 }
 

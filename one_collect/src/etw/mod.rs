@@ -22,6 +22,7 @@ use abi::{
     EVENT_RECORD,
     EVENT_HEADER_EXTENDED_DATA_ITEM,
     CLASSIC_EVENT_ID,
+    EventRecordExt,
 };
 
 pub const PROPERTY_ENABLE_KEYWORD_0: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0;
@@ -58,7 +59,7 @@ impl AncillaryData {
     pub fn cpu(&self) -> u32 {
         match self.event {
             Some(event) => {
-                unsafe { (*event).ProcessorIndex as u32 }
+                unsafe { (*event).processor_index() as u32 }
             },
             None => { 0 },
         }
@@ -92,7 +93,7 @@ impl AncillaryData {
     pub fn time(&self) -> u64 {
         match self.event {
             Some(event) => {
-                unsafe { (*event).EventHeader.TimeStamp }
+                unsafe { (*event).EventHeader.TimeStamp as u64 }
             },
             None => { 0 },
         }
@@ -101,7 +102,7 @@ impl AncillaryData {
     pub fn provider(&self) -> Guid {
         match self.event {
             Some(event) => {
-                unsafe { (*event).EventHeader.ProviderId }
+                unsafe { (*event).provider_guid() }
             },
             None => { Guid::default() },
         }
@@ -110,7 +111,7 @@ impl AncillaryData {
     pub fn activity(&self) -> Guid {
         match self.event {
             Some(event) => {
-                unsafe { (*event).EventHeader.ActivityId }
+                unsafe { (*event).activity_guid() }
             },
             None => { Guid::default() },
         }
@@ -1185,10 +1186,10 @@ impl EtwSession {
         let has_cpu_filter = target_cpus.is_some();
 
         let result = session.process(Box::new(move |event| {
-            let cpu_index = event.ProcessorIndex;
+            let cpu_index = event.processor_index();
 
             /* Find events by provider ID */
-            if let Some(provider_events) = events.get_mut(&event.EventHeader.ProviderId) {
+            if let Some(provider_events) = events.get_mut(&event.provider_guid()) {
                 /* Determine which ID for lookup */
                 let id: usize = match provider_events.use_op_id() {
                     true => { event.EventHeader.EventDescriptor.Opcode.into() },
