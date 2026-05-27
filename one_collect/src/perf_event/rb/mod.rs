@@ -111,6 +111,21 @@ pub fn cpu_count() -> u32 {
     }
 }
 
+/// Size in bytes of the per-CPU ring's data area for a user-supplied page
+/// count.
+///
+/// The kernel requires the data area to be a power-of-two number of
+/// pages, so the user's `page_count` is rounded up via
+/// `next_power_of_two()`. The actual `mmap` is one additional metadata
+/// page on top of this (`ring_data_bytes(n) + PAGE_SIZE`).
+///
+/// This is the bound the `wakeup_events_watermark` must be strictly
+/// smaller than for the kernel to ever wake the perf fd.
+pub(super) fn ring_data_bytes(page_count: usize) -> usize {
+    let page_size = unsafe { sysconf(_SC_PAGE_SIZE) as usize };
+    page_count.next_power_of_two() * page_size
+}
+
 pub fn perf_timestamp(
     attr: &perf_event_attr) -> u64 {
     unsafe {
@@ -284,6 +299,19 @@ impl RingBufBuilder {
             attributes,
             _type: PhantomData::<Bpf>,
         }
+    }
+}
+
+impl<T> RingBufBuilder<T> {
+    /// Configure the kernel to wake up the perf fd only after the ring
+    /// buffer has accumulated at least `bytes` of data.
+    ///
+    /// Sets `FLAG_WATERMARK` and `wakeup_events_watermark` on the
+    /// underlying `perf_event_attr`. A value of `0` keeps the kernel
+    /// default of waking on every event.
+    pub(crate) fn set_wakeup_watermark(&mut self, bytes: u32) {
+        self.attributes.flags |= FLAG_WATERMARK;
+        self.attributes.wakeup_events_watermark = bytes;
     }
 }
 
@@ -843,11 +871,11 @@ impl CpuRingBuf {
                 "Ring buffer is not open."));
         }
 
-        let page_count = page_count.next_power_of_two() + 1;
+        let data_bytes = ring_data_bytes(page_count);
 
         unsafe {
             let page_size = sysconf(_SC_PAGE_SIZE) as usize;
-            let pages_len = page_count * page_size;
+            let pages_len = data_bytes + page_size; /* + metadata page */
 
             let pages = mmap(
                 std::ptr::null_mut::<u8>() as *mut c_void,
