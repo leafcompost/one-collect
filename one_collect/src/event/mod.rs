@@ -566,15 +566,24 @@ impl EventFormat {
 
                 let slice = &data[offset..];
 
-                if slice.len() <= 2 {
-                    /* Out of bounds */
+                if slice.len() < 2 {
+                    /* Not enough data for the u16 length prefix */
                     return EMPTY;
                 }
 
                 let len = u16::from_ne_bytes(
                     slice[0..2].try_into().unwrap()) as usize;
 
-                let bytes = len * size;
+                /* When size is 0, default to byte-counted (element_size=1).
+                 * This handles counted string fields where the u16 prefix
+                 * is a byte count. */
+                let element_size = if size == 0 { 1 } else { size };
+                let bytes = len * element_size;
+
+                if 2 + bytes > slice.len() {
+                    /* Out of bounds */
+                    return EMPTY;
+                }
 
                 &slice[2..2+bytes]
             },
@@ -1080,9 +1089,10 @@ impl EventFormat {
                             }
                         }));
                     },
-                    "char" | "unsigned char" | "string" | "wstring" => {
+                    "char" | "unsigned char" | "string" | "wstring" | "counted_string" => {
                         if field.location == LocationType::StaticUTF16String ||
-                            &field.type_name == "wstring" {
+                            &field.type_name == "wstring" ||
+                            &field.type_name == "counted_string" {
                             return Some(Box::new(move |write, data| {
                                 let field_data = data_closure(data);
                                 let chunks = field_data.chunks_exact(2);
@@ -1156,7 +1166,7 @@ impl EventFormat {
                 }
 
                 match type_name {
-                    "u8" | "s8" | "char" => Some(1),
+                    "u8" | "s8" | "char" | "counted_string" => Some(1),
                     "u16" | "s16" | "short" => Some(2),
                     "u32" | "s32" | "int" => Some(4),
                     "u64" | "s64" | "long" => Some(8),

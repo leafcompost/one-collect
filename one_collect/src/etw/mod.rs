@@ -17,11 +17,8 @@ mod abi;
 mod events;
 pub mod tdh;
 
-/// Re-export `EVENT_RECORD` so consumers of `TdhDecoder` can name the
-/// type without reaching into `abi` (which is `pub(crate)`).
-pub use abi::EVENT_RECORD;
-
 use abi::{
+    EVENT_RECORD,
     TraceSession,
     TraceEnable,
     EVENT_HEADER_EXTENDED_DATA_ITEM,
@@ -87,12 +84,12 @@ impl AncillaryData {
         }
     }
 
-    /// Exposes the raw EVENT_RECORD pointer for TDH decoding.
-    /// Returns None if no event is currently being processed.
-    pub fn raw_event_record(&self) -> Option<*const EVENT_RECORD> {
-        self.event
+    /// Returns a borrow of the current `EVENT_RECORD`, or `None` if no
+    /// event is currently being processed.  The borrow is valid for the
+    /// duration of the ETW callback (same as `&self`).
+    pub fn record(&self) -> Option<&EVENT_RECORD> {
+        self.event.map(|p| unsafe { &*p })
     }
-
 
     pub fn time(&self) -> u64 {
         match self.event {
@@ -217,21 +214,10 @@ impl AncillaryData {
         ext_type: u32) -> Option<*const EVENT_HEADER_EXTENDED_DATA_ITEM> {
         match self.event {
             Some(event) => {
-                unsafe {
-                    let ext = (*event).ExtendedData;
-
-                    for i in 0..(*event).ExtendedDataCount as usize {
-                        let item = ext.add(i);
-
-                        if (*item).ExtType == ext_type as u16 {
-                            return Some(item);
-                        }
-                    }
-
-                    None
-                }
+                // Delegate to the centralized EventRecordExt method.
+                unsafe { (*event).find_extended_data(ext_type as u16) }
             },
-            None => { None},
+            None => None,
         }
     }
 }

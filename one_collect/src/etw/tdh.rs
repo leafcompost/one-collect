@@ -11,20 +11,18 @@
 //!
 //! ## Design
 //!
-//! The decoder maintains two caches keyed by raw schema TL bytes (from
-//! `EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL`), split by pointer width:
+//! The decoder caches the [`EventFormat`] directly, keyed by the raw
+//! TraceLogging schema bytes and pointer width.  Because the format uses
+//! the framework's standard `LocationType` conventions (`StaticString`,
+//! `StaticUTF16String`, etc. with `size = 0` for variable-length fields),
+//! the cached `EventFormat` is schema-stable: it doesn't depend on any
+//! particular event's payload bytes.  A cache hit collapses to a hashmap
+//! probe + `EventData::new` — effectively zero per-event overhead.
 //!
-//! - **Schema layout cache**: The parsed property metadata (field names,
-//!   TDH in-types, struct nesting) discovered from `TdhGetEventInformation`
-//!   on the first occurrence of each schema.  This avoids redundant TDH
-//!   kernel calls.
-//!
-//! - **Per-event offset computation**: Because variable-length fields
-//!   (strings, binary) shift all subsequent field offsets, the concrete
-//!   `EventFormat` with absolute offsets is computed fresh on every call
-//!   to [`TdhDecoder::decode`], walking the cached schema layout against
-//!   the actual event payload bytes.  Fixed-size-only schemas get exact
-//!   offsets directly from the cache with no per-event walk.
+//! Variable-length field resolution (scanning for null terminators, reading
+//! length prefixes) is handled lazily by the framework's existing
+//! `try_get_field_data_closure` skip-chain machinery in `event/mod.rs`.
+//! Only fields the consumer actually reads incur scanning cost.
 //!
 //! ## Scope
 //!
@@ -34,11 +32,9 @@
 //!
 //! - **Not yet supported** (future work): manifest-based event decoding,
 //!   map / enum value resolution, array-typed properties, and properties
-//!   whose length or count is given by another property.  When an
-//!   unsupported property is encountered, the decoder records a
-//!   placeholder field and continues.
+//!   whose length or count is given by another property.
 
-use super::abi::{EVENT_RECORD, EVENT_HEADER_EXTENDED_DATA_ITEM};
+use super::abi::{EVENT_RECORD, EventRecordExt};
 use crate::event::{EventData, EventField, EventFormat, LocationType};
 
 use std::collections::HashMap;
@@ -52,6 +48,7 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     TRACE_EVENT_INFO,
     EVENT_PROPERTY_INFO,
     TdhGetEventInformation,
+    EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
 
     TDH_INTYPE_UNICODESTRING,
     TDH_INTYPE_ANSISTRING,
@@ -78,24 +75,28 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     TDH_INTYPE_REVERSEDCOUNTEDSTRING,
     TDH_INTYPE_NONNULLTERMINATEDSTRING,
     TDH_INTYPE_NONNULLTERMINATEDANSISTRING,
+
+    // PROPERTY_FLAGS enum values used in EVENT_PROPERTY_INFO::Flags.
+    PropertyStruct,
+    PropertyParamLength,
+    PropertyParamCount,
+    PropertyParamFixedLength,
 };
 
-use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND};
 
 /// `EVENT_HEADER_FLAG_32_BIT_HEADER` from the Windows SDK.
 const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
 
-/// Property flag constants from `EVENT_PROPERTY_INFO::Flags` (i32 in windows-sys).
-const PROPERTY_STRUCT: i32      = 0x1;
-const PROPERTY_HAS_LENGTH: i32  = 0x4;
-const PROPERTY_HAS_COUNT: i32   = 0x8;
-/// `PROPERTY_PARAM_LENGTH` — when set together with `PROPERTY_HAS_LENGTH`,
-/// `Anonymous3.length` is an *index* into the property array (not a literal
-/// byte count).  We must not treat it as a fixed size in that case.
-const PROPERTY_PARAM_LENGTH: i32 = 0x10;
+// Aliases for PROPERTY_FLAGS constants (i32 in windows-sys) to keep
+// call-site flag checks concise.
+const PROPERTY_STRUCT: i32             = PropertyStruct;
+const PROPERTY_PARAM_LENGTH: i32       = PropertyParamLength;
+const PROPERTY_PARAM_COUNT: i32        = PropertyParamCount;
+const PROPERTY_PARAM_FIXED_LENGTH: i32 = PropertyParamFixedLength;
 
-/// Extended-data item type for TraceLogging schema metadata.
-const EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL: u16 = 11;
+// EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL is imported from windows-sys
+// (u32 = 11).  Usage sites cast to u16 where the ExtType field requires it.
 
 // ── Error type ──────────────────────────────────────────────────────
 
@@ -123,71 +124,30 @@ impl std::fmt::Display for TdhDecodeError {
 
 impl std::error::Error for TdhDecodeError {}
 
-// ── Cached schema layout (field names + types, no runtime offsets) ───
+// ── Cached schema ───────────────────────────────────────────────────
 
-/// Describes what kind of data a TDH property holds, used to determine
-/// its runtime byte length when walking event payload bytes.
-#[derive(Clone, Debug, PartialEq)]
-enum PropertyKind {
-    /// Fixed-size scalar (size known at schema time).
-    Fixed(usize),
-    /// Null-terminated ANSI string (variable length at runtime).
-    AnsiString,
-    /// Null-terminated UTF-16 string (variable length at runtime).
-    Utf16String,
-    /// Counted string: 2-byte `u16` length prefix followed by `len`
-    /// bytes of string data.  Runtime size = `2 + len`.
-    CountedString,
-    /// Variable-length blob whose size is not known at schema time
-    /// (binary, SID, etc.).  When this is the last field, it consumes
-    /// all remaining bytes.  When followed by more fields, it uses the
-    /// TDH-reported explicit length if available, otherwise consumes
-    /// all remaining bytes (best effort).
-    VariableBlob,
-    /// Unsupported: array or param-driven property.  Placeholder that
-    /// uses TDH-reported explicit length if available, otherwise
-    /// consumes all remaining bytes.
-    Unsupported,
-}
-
-/// A single property in a cached schema layout.
-#[derive(Clone, Debug)]
-struct CachedProperty {
-    /// Dot-notation qualified name (e.g. `"PartA.Name"`).
-    name: String,
-    /// Type name string for the `EventField` (e.g. `"u32"`, `"wstring"`).
-    /// Always one of a fixed set of static strings.
-    type_name: &'static str,
-    /// What kind of data / how to compute runtime length.
-    kind: PropertyKind,
-}
-
-/// The schema layout extracted from TDH on first encounter.
-/// Contains everything needed to build an `EventFormat` per-event.
+/// Cached schema: the event name and the `EventFormat` that the
+/// framework's `try_get_field_data_closure` can resolve lazily.
 #[derive(Clone)]
 struct CachedSchema {
-    /// The TraceLogging event name extracted from `TRACE_EVENT_INFO`.
-    /// Empty if the name could not be read.
+    /// The TraceLogging event name.
     event_name: String,
-    /// Ordered list of leaf properties (structs already flattened).
-    properties: Vec<CachedProperty>,
-    /// Pre-built `EventFormat` for the all-fixed fast path.
-    /// `Some` when every property is `PropertyKind::Fixed` (offsets are
-    /// constant across events).  `None` when the schema contains any
-    /// variable-length fields and offsets must be computed per-event.
-    fixed_format: Option<EventFormat>,
+    /// Schema-stable `EventFormat` — field offsets are absolute for
+    /// fixed-size fields, and the framework's skip chain handles
+    /// variable-length fields lazily via `size = 0`.
+    format: EventFormat,
 }
 
 /// Hash builder using XxHash64, matching the rest of the ETW module.
 type XxBuildHasher = BuildHasherDefault<XxHash64>;
 
 /// Schema cache: two maps (32-bit / 64-bit) keyed by raw TL bytes.
-struct SchemaLayoutCache {
+struct SchemaCache {
     cache_64: HashMap<Vec<u8>, CachedSchema, XxBuildHasher>,
     cache_32: HashMap<Vec<u8>, CachedSchema, XxBuildHasher>,
 }
 
-impl SchemaLayoutCache {
+impl SchemaCache {
     fn new() -> Self {
         Self {
             cache_64: HashMap::with_hasher(XxBuildHasher::default()),
@@ -209,27 +169,26 @@ impl SchemaLayoutCache {
 // ── TdhDecoder ──────────────────────────────────────────────────────
 
 /// Runtime decoder for TraceLogging / TraceLoggingDynamic ETW events.
+///
+/// Caches the `EventFormat` directly per schema.  Cache hits are a
+/// hashmap probe + `EventData::new` with no per-event allocation.
 pub struct TdhDecoder {
-    cache: SchemaLayoutCache,
-    /// Reusable `EventFormat` buffer to avoid per-event allocation
-    /// when the schema has variable-length fields.
-    format_buf: EventFormat,
+    cache: SchemaCache,
+    /// Reusable aligned buffer for `TdhGetEventInformation` results.
+    tei_buf: AlignedTeiBuf,
 }
 
 impl TdhDecoder {
     /// Creates a new decoder with an empty schema cache.
     pub fn new() -> Self {
         Self {
-            cache: SchemaLayoutCache::new(),
-            format_buf: EventFormat::new(),
+            cache: SchemaCache::new(),
+            tei_buf: AlignedTeiBuf::new(),
         }
     }
 
     /// Returns the cached event name for the given event's schema, or
     /// `None` if the schema has not been seen yet or has no name.
-    ///
-    /// This is the TraceLogging event name — the primary identity for
-    /// TraceLogging events (as opposed to the event ID, which is often 0).
     pub fn event_name(&self, record: &EVENT_RECORD) -> Option<&str> {
         let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
         let schema_tl_bytes = find_schema_tl(record).ok()?;
@@ -243,11 +202,10 @@ impl TdhDecoder {
 
     /// Decodes an `EVENT_RECORD` into an [`EventData`].
     ///
-    /// For schemas with only fixed-size fields, the cached `EventFormat`
-    /// is returned directly (zero per-event allocation).  For schemas
-    /// with variable-length fields, the concrete offsets are computed
-    /// by walking the event's user-data payload against the cached
-    /// schema layout.
+    /// The returned `EventData` references the cached `EventFormat`
+    /// (schema-stable).  Consumers use the framework's standard
+    /// `try_get_field_data_closure` to resolve individual field values
+    /// lazily against the event's `user_data` payload.
     pub fn decode<'a>(
         &'a mut self,
         record: &'a EVENT_RECORD,
@@ -255,34 +213,22 @@ impl TdhDecoder {
         let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
         let schema_tl_bytes = find_schema_tl(record)?;
 
-        // Cache: check-then-insert.  Two hash lookups on miss (get +
-        // insert), one on hit (get only).  We avoid raw_entry_mut
-        // which requires nightly, and the entry API which would need
-        // a key clone on every call (hit or miss).
         if self.cache.get(schema_tl_bytes, is_32bit).is_none() {
-            let tei_buf = call_tdh_get_event_information(record)?;
-            let schema = build_cached_schema(tei_buf.as_bytes(), is_32bit)?;
+            call_tdh_get_event_information(record, &mut self.tei_buf)?;
+            let schema = build_cached_schema(self.tei_buf.as_bytes(), is_32bit)?;
             debug!(
                 event_name = %schema.event_name,
-                property_count = schema.properties.len(),
-                all_fixed = schema.fixed_format.is_some(),
+                field_count = schema.format.fields().len(),
                 is_32bit,
                 "TDH schema cache miss — new schema cached"
             );
             self.cache.insert(schema_tl_bytes.to_vec(), is_32bit, schema);
         }
-        let schema = self.cache.get(schema_tl_bytes, is_32bit).unwrap();
+        let schema = self.cache.get(schema_tl_bytes, is_32bit)
+            .expect("just inserted");
 
-        let user_data = event_user_data(record);
-
-        if let Some(ref fixed_format) = schema.fixed_format {
-            // Fast path: all fields are fixed-size, offsets are constant.
-            Ok(EventData::new(user_data, user_data, fixed_format))
-        } else {
-            // Slow path: compute offsets by walking user_data.
-            self.format_buf = build_event_format_with_data(&schema.properties, user_data);
-            Ok(EventData::new(user_data, user_data, &self.format_buf))
-        }
+        let user_data = record.user_data_slice();
+        Ok(EventData::new(user_data, user_data, &schema.format))
     }
 }
 
@@ -290,97 +236,13 @@ impl Default for TdhDecoder {
     fn default() -> Self { Self::new() }
 }
 
-// ── Per-event offset computation ────────────────────────────────────
-
-/// Builds an `EventFormat` by walking `user_data` to compute the actual
-/// runtime offset of each field, handling variable-length fields correctly.
-fn build_event_format_with_data(
-    properties: &[CachedProperty],
-    user_data: &[u8],
-) -> EventFormat {
-    let mut format = EventFormat::new();
-    let mut offset: usize = 0;
-
-    for prop in properties {
-        let (loc, size) = match &prop.kind {
-            PropertyKind::Fixed(sz) => {
-                (LocationType::Static, *sz)
-            }
-            PropertyKind::AnsiString => {
-                let len = scan_ansi_string(&user_data[offset.min(user_data.len())..]);
-                (LocationType::Static, len)
-            }
-            PropertyKind::Utf16String => {
-                let len = scan_utf16_string(&user_data[offset.min(user_data.len())..]);
-                (LocationType::Static, len)
-            }
-            PropertyKind::CountedString => {
-                let len = scan_counted_string(&user_data[offset.min(user_data.len())..]);
-                (LocationType::Static, len)
-            }
-            PropertyKind::VariableBlob => {
-                let remaining = user_data.len().saturating_sub(offset);
-                (LocationType::Static, remaining)
-            }
-            PropertyKind::Unsupported => {
-                let remaining = user_data.len().saturating_sub(offset);
-                (LocationType::Static, remaining)
-            }
-        };
-
-        format.add_field(EventField::new(
-            prop.name.clone(),
-            prop.type_name.to_string(),
-            loc,
-            offset,
-            size,
-        ));
-
-        offset += size;
-    }
-
-    format
-}
-
-/// Scans for a null-terminated ANSI string, returning the number of
-/// bytes consumed **including** the null terminator.
-fn scan_ansi_string(data: &[u8]) -> usize {
-    match data.iter().position(|&b| b == 0) {
-        Some(pos) => pos + 1, // include the null byte
-        None => data.len(),   // unterminated — take everything
-    }
-}
-
-/// Scans for a null-terminated UTF-16LE string, returning the number of
-/// bytes consumed **including** the two-byte null terminator.
-fn scan_utf16_string(data: &[u8]) -> usize {
-    let mut pos = 0;
-    while pos + 1 < data.len() {
-        if data[pos] == 0 && data[pos + 1] == 0 {
-            return pos + 2; // include the null pair
-        }
-        pos += 2;
-    }
-    data.len() // unterminated
-}
-
-/// Reads a counted-string field: a 2-byte little-endian `u16` length
-/// prefix followed by `len` bytes of string data.
-///
-/// Returns the total number of bytes consumed (`2 + len`), or all
-/// remaining bytes if the prefix cannot be read.
-fn scan_counted_string(data: &[u8]) -> usize {
-    if data.len() < 2 {
-        return data.len(); // not enough for the length prefix
-    }
-    let len = u16::from_le_bytes([data[0], data[1]]) as usize;
-    let total = 2 + len;
-    total.min(data.len()) // clamp to available data
-}
-
 // ── Schema extraction from TDH ──────────────────────────────────────
 
 /// Builds a `CachedSchema` from a `TRACE_EVENT_INFO` buffer.
+///
+/// Emits `EventField`s using the framework's standard `LocationType`
+/// conventions so the resulting `EventFormat` is schema-stable and
+/// can be cached directly.
 fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, TdhDecodeError> {
     if tei_buf.len() < std::mem::size_of::<TRACE_EVENT_INFO>() {
         return Err(TdhDecodeError::Malformed("buffer smaller than TRACE_EVENT_INFO"));
@@ -390,19 +252,23 @@ fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, T
     let property_count = tei.PropertyCount as usize;
     let top_level_count = tei.TopLevelPropertyCount as usize;
 
-    // Extract the event name (#7).
     let event_name = read_event_name(tei_buf, tei);
 
     if property_count == 0 {
         return Ok(CachedSchema {
             event_name,
-            properties: Vec::new(),
-            fixed_format: Some(EventFormat::new()),
+            format: EventFormat::new(),
         });
     }
 
-    let props_offset = std::mem::size_of::<TRACE_EVENT_INFO>();
-    let props_end = props_offset + property_count * std::mem::size_of::<EVENT_PROPERTY_INFO>();
+    let props_offset = std::mem::size_of::<TRACE_EVENT_INFO>()
+        - std::mem::size_of::<EVENT_PROPERTY_INFO>();
+    let props_size = property_count
+        .checked_mul(std::mem::size_of::<EVENT_PROPERTY_INFO>())
+        .ok_or(TdhDecodeError::Malformed("property count overflow"))?;
+    let props_end = props_offset
+        .checked_add(props_size)
+        .ok_or(TdhDecodeError::Malformed("property array end overflow"))?;
     if tei_buf.len() < props_end {
         return Err(TdhDecodeError::Malformed("buffer too small for declared property count"));
     }
@@ -414,52 +280,39 @@ fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, T
         )
     };
 
-    let mut cached_props = Vec::new();
-    walk_properties_to_cache(
+    let mut format = EventFormat::new();
+    let mut running_offset: usize = 0;
+    // Once we encounter the first variable-length field, all subsequent
+    // offsets become 0 (the framework's skip chain resolves them lazily).
+    let mut seen_variable = false;
+
+    walk_properties(
         tei_buf, properties, 0..top_level_count,
-        "", &mut cached_props, is_32bit,
+        "", &mut format, &mut running_offset, &mut seen_variable, is_32bit, 0,
     )?;
-
-    let all_fixed = cached_props.iter().all(|p| matches!(p.kind, PropertyKind::Fixed(_)));
-
-    let fixed_format = if all_fixed {
-        let mut fmt = EventFormat::new();
-        let mut offset = 0usize;
-        for prop in &cached_props {
-            let sz = match &prop.kind {
-                PropertyKind::Fixed(s) => *s,
-                _ => unreachable!(),
-            };
-            fmt.add_field(EventField::new(
-                prop.name.clone(),
-                prop.type_name.to_string(),
-                LocationType::Static,
-                offset,
-                sz,
-            ));
-            offset += sz;
-        }
-        Some(fmt)
-    } else {
-        None
-    };
 
     Ok(CachedSchema {
         event_name,
-        properties: cached_props,
-        fixed_format,
+        format,
     })
 }
 
-/// Recursively walks TDH properties, flattening structs, and builds
-/// the cached property list.
-fn walk_properties_to_cache(
+/// Maximum nesting depth for struct properties.
+const MAX_STRUCT_DEPTH: usize = 8;
+
+/// Recursively walks TDH properties, flattening structs, and emits
+/// `EventField`s directly into the `EventFormat` using the framework's
+/// `LocationType` conventions.
+fn walk_properties(
     tei_buf: &[u8],
     properties: &[EVENT_PROPERTY_INFO],
     range: std::ops::Range<usize>,
     prefix: &str,
-    out: &mut Vec<CachedProperty>,
+    format: &mut EventFormat,
+    running_offset: &mut usize,
+    seen_variable: &mut bool,
     is_32bit: bool,
+    depth: usize,
 ) -> Result<(), TdhDecodeError> {
     for i in range {
         if i >= properties.len() {
@@ -478,49 +331,161 @@ fn walk_properties_to_cache(
 
         // ── Struct property ─────────────────────────────────────────
         if (flags & PROPERTY_STRUCT) != 0 {
+            if depth >= MAX_STRUCT_DEPTH {
+                warn!(
+                    field = %qualified_name,
+                    depth,
+                    max = MAX_STRUCT_DEPTH,
+                    "struct nesting depth exceeded — truncating sub-fields"
+                );
+                // Emit a placeholder that consumes remaining bytes.
+                let offset = if *seen_variable { 0 } else { *running_offset };
+                format.add_field(EventField::new(
+                    qualified_name, "unsupported".to_string(),
+                    LocationType::Static, offset, 0,
+                ));
+                *seen_variable = true;
+                continue;
+            }
             let struct_info = unsafe { prop.Anonymous1.structType };
             let start = struct_info.StructStartIndex as usize;
             let count = struct_info.NumOfStructMembers as usize;
-            walk_properties_to_cache(
+            walk_properties(
                 tei_buf, properties, start..start + count,
-                &qualified_name, out, is_32bit,
+                &qualified_name, format, running_offset, seen_variable, is_32bit, depth + 1,
             )?;
             continue;
         }
 
         // ── Array/param-count properties ─────────────────────────────
-        if (flags & PROPERTY_HAS_COUNT) != 0 {
+        if (flags & PROPERTY_PARAM_COUNT) != 0 {
             let count = unsafe { prop.Anonymous2.count } as usize;
             if count != 1 {
                 debug!(field = %qualified_name, count, "skipping unsupported array property");
-                out.push(CachedProperty {
-                    name: qualified_name,
-                    type_name: "unsupported_array",
-                    kind: PropertyKind::Unsupported,
-                });
+                let offset = if *seen_variable { 0 } else { *running_offset };
+                format.add_field(EventField::new(
+                    qualified_name, "unsupported".to_string(),
+                    LocationType::Static, offset, 0,
+                ));
+                *seen_variable = true;
                 continue;
             }
-            // count == 1: fall through to normal leaf decoding below.
         }
 
         // ── Leaf property ───────────────────────────────────────────
         let in_type = unsafe { prop.Anonymous1.nonStructType.InType } as i32;
-        let (type_name, kind) = intype_to_cached_info(in_type, is_32bit, prop);
+
+        // Read the raw TDH length before interpretation.
+        let raw_len = unsafe { prop.Anonymous3.length } as usize;
 
         debug!(
             field = %qualified_name,
             in_type,
-            flags,
-            type_name,
-            kind = ?kind,
-            "TDH property decoded"
+            flags = format!("0x{:x}", flags),
+            raw_len,
+            "TDH property leaf"
         );
 
-        out.push(CachedProperty {
-            name: qualified_name,
-            type_name,
-            kind,
-        });
+        // Read the TDH-reported byte length for this property.
+        //
+        // When `PropertyParamLength` (0x2) is set, `Anonymous3` holds a
+        // property *index* (parameterized length) — we must NOT interpret
+        // it as a literal byte count.  In all other cases (including
+        // `flags = 0x0`, common for TraceLoggingDynamic self-describing
+        // fields with in_type >= 256), `Anonymous3.length` is a direct
+        // byte count that TDH populates from the schema.
+        // For variable-length in_types (counted strings, non-null-terminated
+        // strings), never use the TDH-reported length as a fixed size because
+        // it is per-event and the schema is cached.  Force these through the
+        // dynamic LocationType path instead.
+        let is_variable_intype = matches!(
+            in_type,
+            TDH_INTYPE_UNICODESTRING
+            | TDH_INTYPE_ANSISTRING
+            | TDH_INTYPE_COUNTEDSTRING
+            | TDH_INTYPE_REVERSEDCOUNTEDSTRING
+            | TDH_INTYPE_NONNULLTERMINATEDSTRING
+            | TDH_INTYPE_NONNULLTERMINATEDANSISTRING
+        );
+
+        let explicit_len: Option<usize> = if is_variable_intype {
+            // Variable-length types must use their LocationType-specific
+            // decoding (null-scan or length-prefix) rather than a cached
+            // per-event byte count.
+            None
+        } else if (flags & PROPERTY_PARAM_LENGTH) == 0 {
+            let len = raw_len;
+            if len > 0 { Some(len) } else { None }
+        } else {
+            None
+        };
+
+        let offset = if *seen_variable { 0 } else { *running_offset };
+
+        // If we have an explicit byte length, treat as fixed regardless
+        // of the in_type.
+        if let Some(len) = explicit_len {
+            let type_name = intype_to_type_name(in_type);
+            format.add_field(EventField::new(
+                qualified_name, type_name.to_string(),
+                LocationType::Static, offset, len,
+            ));
+            if !*seen_variable {
+                *running_offset += len;
+            }
+            continue;
+        }
+
+        // Map TDH in-type to the framework's LocationType + size.
+        let (type_name, loc, size) = match in_type {
+            // Fixed-size scalars
+            TDH_INTYPE_INT8                          => ("s8",   LocationType::Static, 1),
+            TDH_INTYPE_UINT8 | TDH_INTYPE_BOOLEAN   => ("u8",   LocationType::Static, 1),
+            TDH_INTYPE_INT16                         => ("s16",  LocationType::Static, 2),
+            TDH_INTYPE_UINT16                        => ("u16",  LocationType::Static, 2),
+            TDH_INTYPE_INT32 | TDH_INTYPE_HEXINT32  => ("s32",  LocationType::Static, 4),
+            TDH_INTYPE_UINT32                        => ("u32",  LocationType::Static, 4),
+            TDH_INTYPE_INT64 | TDH_INTYPE_HEXINT64  => ("s64",  LocationType::Static, 8),
+            TDH_INTYPE_UINT64                        => ("u64",  LocationType::Static, 8),
+            TDH_INTYPE_FLOAT                         => ("float", LocationType::Static, 4),
+            TDH_INTYPE_DOUBLE                        => ("double", LocationType::Static, 8),
+            TDH_INTYPE_POINTER => {
+                let sz = if is_32bit { 4 } else { 8 };
+                ("pointer", LocationType::Static, sz)
+            }
+            TDH_INTYPE_FILETIME                      => ("filetime",   LocationType::Static, 8),
+            TDH_INTYPE_SYSTEMTIME                    => ("systemtime", LocationType::Static, 16),
+            TDH_INTYPE_GUID                          => ("guid",       LocationType::Static, 16),
+
+            // Variable-length: null-terminated strings → size = 0
+            TDH_INTYPE_ANSISTRING |
+            TDH_INTYPE_NONNULLTERMINATEDANSISTRING   => ("string",  LocationType::StaticString, 0),
+
+            TDH_INTYPE_UNICODESTRING |
+            TDH_INTYPE_NONNULLTERMINATEDSTRING       => ("wstring", LocationType::StaticUTF16String, 0),
+
+            // Variable-length: counted/length-prefixed
+            TDH_INTYPE_COUNTEDSTRING |
+            TDH_INTYPE_REVERSEDCOUNTEDSTRING         => ("counted_string", LocationType::StaticLenPrefixArray, 0),
+
+            // Variable-length: binary blobs, SID
+            TDH_INTYPE_SID | TDH_INTYPE_BINARY      => ("binary", LocationType::Static, 0),
+
+            // Unknown — treat as variable-length placeholder
+            _ => ("unsupported", LocationType::Static, 0),
+        };
+
+        format.add_field(EventField::new(
+            qualified_name, type_name.to_string(),
+            loc, offset, size,
+        ));
+
+        if size == 0 {
+            // Variable-length field: all subsequent offsets become 0.
+            *seen_variable = true;
+        } else if !*seen_variable {
+            *running_offset += size;
+        }
     }
 
     Ok(())
@@ -528,56 +493,53 @@ fn walk_properties_to_cache(
 
 // ── Internal helpers ────────────────────────────────────────────────
 
-fn event_user_data<'a>(record: &'a EVENT_RECORD) -> &'a [u8] {
-    if record.UserData.is_null() || record.UserDataLength == 0 {
-        &[]
-    } else {
-        unsafe {
-            std::slice::from_raw_parts(
-                record.UserData as *const u8,
-                record.UserDataLength as usize,
-            )
-        }
-    }
-}
-
+/// Finds the TraceLogging schema metadata in the event's extended-data.
 fn find_schema_tl<'a>(record: &'a EVENT_RECORD) -> Result<&'a [u8], TdhDecodeError> {
-    if record.ExtendedDataCount == 0 || record.ExtendedData.is_null() {
+    let item_ptr = record
+        .find_extended_data(EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL as u16)
+        .ok_or(TdhDecodeError::NotFound)?;
+    let item = unsafe { &*item_ptr };
+    if item.DataPtr == 0 || item.DataSize == 0 {
         return Err(TdhDecodeError::NotFound);
     }
-    let items: &[EVENT_HEADER_EXTENDED_DATA_ITEM] = unsafe {
-        std::slice::from_raw_parts(record.ExtendedData, record.ExtendedDataCount as usize)
-    };
-    for item in items {
-        if item.ExtType == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL {
-            if item.DataPtr == 0 || item.DataSize == 0 { continue; }
-            return Ok(unsafe {
-                std::slice::from_raw_parts(item.DataPtr as *const u8, item.DataSize as usize)
-            });
-        }
-    }
-    Err(TdhDecodeError::NotFound)
+    Ok(unsafe {
+        std::slice::from_raw_parts(item.DataPtr as *const u8, item.DataSize as usize)
+    })
 }
 
-/// Aligned buffer for `TRACE_EVENT_INFO`.  Uses `Vec<u64>` to guarantee
-/// 8-byte alignment (TRACE_EVENT_INFO requires at least 4-byte alignment
-/// due to u32 fields, and EVENT_PROPERTY_INFO following it contains u64
-/// offsets on 64-bit builds).
+/// Aligned buffer for `TRACE_EVENT_INFO`.
 struct AlignedTeiBuf {
-    /// Storage with 8-byte alignment.
     storage: Vec<u64>,
-    /// Actual byte length returned by TDH.
     len: usize,
 }
 
 impl AlignedTeiBuf {
+    fn new() -> Self {
+        Self { storage: Vec::new(), len: 0 }
+    }
+
+    fn ensure_capacity(&mut self, byte_count: usize) {
+        let u64_count = (byte_count + 7) / 8;
+        if self.storage.len() < u64_count {
+            self.storage.resize(u64_count, 0u64);
+        }
+    }
+
     fn as_bytes(&self) -> &[u8] {
         let ptr = self.storage.as_ptr() as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
+
+    fn as_mut_ptr(&mut self) -> *mut TRACE_EVENT_INFO {
+        self.storage.as_mut_ptr() as *mut TRACE_EVENT_INFO
+    }
 }
 
-fn call_tdh_get_event_information(record: &EVENT_RECORD) -> Result<AlignedTeiBuf, TdhDecodeError> {
+/// Calls `TdhGetEventInformation`, growing the buffer as needed.
+fn call_tdh_get_event_information(
+    record: &EVENT_RECORD,
+    buf: &mut AlignedTeiBuf,
+) -> Result<(), TdhDecodeError> {
     let mut buffer_size: u32 = 0;
     let status = unsafe {
         TdhGetEventInformation(
@@ -585,153 +547,73 @@ fn call_tdh_get_event_information(record: &EVENT_RECORD) -> Result<AlignedTeiBuf
             core::ptr::null(), core::ptr::null_mut(), &mut buffer_size,
         )
     };
+    if status == ERROR_NOT_FOUND {
+        return Err(TdhDecodeError::NotFound);
+    }
     if status != ERROR_INSUFFICIENT_BUFFER {
         warn!(win32_error = status, "TdhGetEventInformation sizing call failed");
         return Err(TdhDecodeError::Win32(status));
     }
     if buffer_size == 0 {
-        warn!("TdhGetEventInformation returned zero buffer size");
         return Err(TdhDecodeError::Malformed("TDH returned zero buffer size"));
     }
-    // Allocate with u64 alignment (8 bytes), rounding up.
-    let u64_count = (buffer_size as usize + 7) / 8;
-    let mut storage: Vec<u64> = vec![0u64; u64_count];
+    buf.ensure_capacity(buffer_size as usize);
     let status = unsafe {
         TdhGetEventInformation(
             record as *const EVENT_RECORD, 0u32,
-            core::ptr::null(),
-            storage.as_mut_ptr() as *mut TRACE_EVENT_INFO,
-            &mut buffer_size,
+            core::ptr::null(), buf.as_mut_ptr(), &mut buffer_size,
         )
     };
     if status != 0 {
         warn!(win32_error = status, "TdhGetEventInformation fill call failed");
         return Err(TdhDecodeError::Win32(status));
     }
+    buf.len = buffer_size as usize;
     trace!(buffer_size, "TdhGetEventInformation succeeded");
-    Ok(AlignedTeiBuf { storage, len: buffer_size as usize })
+    Ok(())
 }
 
+// SAFETY guard for the `EventNameOffset` union read below.
+// `TRACE_EVENT_INFO_0` is a union with two `u32` arms
+// (`EventNameOffset` and `ActivityIDNameOffset`) at the same offset.
+// Either arm always yields a valid bit pattern for a `u32`.
+const _: () = assert!(
+    std::mem::size_of::<
+        windows_sys::Win32::System::Diagnostics::Etw::TRACE_EVENT_INFO_0
+    >() == 4,
+    "TRACE_EVENT_INFO_0 union must remain 4 bytes",
+);
+
 /// Reads the TraceLogging event name from `TRACE_EVENT_INFO`.
-///
-/// The `EventNameOffset` field is at byte offset 92 in the struct (after
-/// `TaskNameOffset` at 88).  It points to a null-terminated UTF-16LE
-/// string within the same buffer.
 fn read_event_name(tei_buf: &[u8], tei: &TRACE_EVENT_INFO) -> String {
-    // TRACE_EVENT_INFO::EventNameOffset is a u32 at a known position.
-    // In windows-sys it's accessible as tei.EventNameOffset on some
-    // versions, but we read it safely from the raw buffer to avoid
-    // version-specific anonymous union layouts.
-    //
-    // Offset 92 = EventNameOffset in the Windows SDK TRACE_EVENT_INFO
-    // layout (confirmed against windows 0.61 and windows-sys 0.59).
-    const EVENT_NAME_OFFSET_POS: usize = 92;
-    if tei_buf.len() < EVENT_NAME_OFFSET_POS + 4 {
-        return String::new();
-    }
-    let name_offset_bytes: [u8; 4] = tei_buf[EVENT_NAME_OFFSET_POS..EVENT_NAME_OFFSET_POS + 4]
-        .try_into()
-        .unwrap();
-    let name_offset = u32::from_le_bytes(name_offset_bytes) as usize;
-
-    // Fallback: try the struct field directly if available.
-    let _ = tei; // suppress unused warning; we use the raw buffer above.
-
+    // SAFETY: Both arms of `TRACE_EVENT_INFO_0` are `u32` at the same
+    // offset, so either arm always yields a valid bit pattern.  The
+    // const assertion above guards the 4-byte size against future
+    // `windows-sys` layout drift.
+    let name_offset = unsafe { tei.Anonymous1.EventNameOffset } as usize;
     read_utf16_at(tei_buf, name_offset)
 }
 
-/// Reads the null-terminated UTF-16 property name from the
-/// `TRACE_EVENT_INFO` buffer at the offset indicated by the property.
-///
-/// Avoids the intermediate `Vec<u16>` allocation by using an iterator-
-/// based decode (#4).
+/// Reads a null-terminated UTF-16 property name from the TEI buffer.
 fn read_property_name(tei_buf: &[u8], prop: &EVENT_PROPERTY_INFO) -> String {
     read_utf16_at(tei_buf, prop.NameOffset as usize)
 }
 
 /// Reads a null-terminated UTF-16LE string from `buf` at `byte_offset`.
-///
-/// Returns an empty string if the offset is out of bounds.  Uses
-/// `String::from_utf16_lossy` but feeds it from an iterator to avoid
-/// an intermediate `Vec<u16>` allocation for small names (#4).
 fn read_utf16_at(buf: &[u8], byte_offset: usize) -> String {
     if byte_offset == 0 || byte_offset >= buf.len() {
         return String::new();
     }
     let remaining = &buf[byte_offset..];
-    // Decode UTF-16LE code units, stopping at null.
-    let u16_iter = remaining
+    let u16s: Vec<u16> = remaining
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .take_while(|&c| c != 0);
-    // Collect into a small vec — property names are typically short.
-    let u16s: Vec<u16> = u16_iter.collect();
+        .take_while(|&c| c != 0)
+        .collect();
     String::from_utf16_lossy(&u16s)
 }
 
-/// Maps a TDH_INTYPE to a `(type_name, PropertyKind)`.
-///
-/// Returns `&'static str` for type_name to avoid per-property heap
-/// allocation (#10).
-fn intype_to_cached_info(
-    in_type: i32,
-    is_32bit: bool,
-    prop: &EVENT_PROPERTY_INFO,
-) -> (&'static str, PropertyKind) {
-    // Check for explicit length (literal byte count for TraceLogging).
-    // Guard against PROPERTY_PARAM_LENGTH (#6): when that flag is set,
-    // `Anonymous3.length` is a property *index*, not a byte count.
-    let explicit_len: Option<usize> = if (prop.Flags & PROPERTY_HAS_LENGTH) != 0
-        && (prop.Flags & PROPERTY_PARAM_LENGTH) == 0
-    {
-        let len = unsafe { prop.Anonymous3.length } as usize;
-        if len > 0 { Some(len) } else { None }
-    } else {
-        None
-    };
-
-    // If the property has a literal byte length, treat it as fixed-size.
-    if let Some(len) = explicit_len {
-        let type_name = intype_to_type_name(in_type);
-        return (type_name, PropertyKind::Fixed(len));
-    }
-
-    match in_type {
-        TDH_INTYPE_INT8                          => ("s8",   PropertyKind::Fixed(1)),
-        TDH_INTYPE_UINT8 | TDH_INTYPE_BOOLEAN   => ("u8",   PropertyKind::Fixed(1)),
-        TDH_INTYPE_INT16                         => ("s16",  PropertyKind::Fixed(2)),
-        TDH_INTYPE_UINT16                        => ("u16",  PropertyKind::Fixed(2)),
-        TDH_INTYPE_INT32 | TDH_INTYPE_HEXINT32  => ("s32",  PropertyKind::Fixed(4)),
-        TDH_INTYPE_UINT32                        => ("u32",  PropertyKind::Fixed(4)),
-        TDH_INTYPE_INT64 | TDH_INTYPE_HEXINT64  => ("s64",  PropertyKind::Fixed(8)),
-        TDH_INTYPE_UINT64                        => ("u64",  PropertyKind::Fixed(8)),
-        TDH_INTYPE_FLOAT                         => ("f32",  PropertyKind::Fixed(4)),
-        TDH_INTYPE_DOUBLE                        => ("f64",  PropertyKind::Fixed(8)),
-        TDH_INTYPE_POINTER => {
-            let sz = if is_32bit { 4 } else { 8 };
-            ("pointer", PropertyKind::Fixed(sz))
-        }
-        TDH_INTYPE_FILETIME                      => ("filetime",   PropertyKind::Fixed(8)),
-        TDH_INTYPE_SYSTEMTIME                    => ("systemtime", PropertyKind::Fixed(16)),
-        TDH_INTYPE_GUID                          => ("guid",       PropertyKind::Fixed(16)),
-
-        TDH_INTYPE_ANSISTRING |
-        TDH_INTYPE_NONNULLTERMINATEDANSISTRING   => ("string",  PropertyKind::AnsiString),
-
-        TDH_INTYPE_UNICODESTRING |
-        TDH_INTYPE_NONNULLTERMINATEDSTRING       => ("wstring", PropertyKind::Utf16String),
-
-        TDH_INTYPE_SID                           => ("sid",            PropertyKind::VariableBlob),
-        TDH_INTYPE_BINARY                        => ("binary",         PropertyKind::VariableBlob),
-        TDH_INTYPE_COUNTEDSTRING |
-        TDH_INTYPE_REVERSEDCOUNTEDSTRING         => ("counted_string", PropertyKind::CountedString),
-
-        _ => ("unsupported", PropertyKind::VariableBlob),
-    }
-}
-
-/// Returns just the type_name string for a TDH_INTYPE (used when
-/// explicit_len overrides the kind to Fixed).
+/// Returns the type_name string for a TDH_INTYPE.
 fn intype_to_type_name(in_type: i32) -> &'static str {
     match in_type {
         TDH_INTYPE_INT8                          => "s8",
@@ -742,8 +624,8 @@ fn intype_to_type_name(in_type: i32) -> &'static str {
         TDH_INTYPE_UINT32                        => "u32",
         TDH_INTYPE_INT64 | TDH_INTYPE_HEXINT64  => "s64",
         TDH_INTYPE_UINT64                        => "u64",
-        TDH_INTYPE_FLOAT                         => "f32",
-        TDH_INTYPE_DOUBLE                        => "f64",
+        TDH_INTYPE_FLOAT                         => "float",
+        TDH_INTYPE_DOUBLE                        => "double",
         TDH_INTYPE_POINTER                       => "pointer",
         TDH_INTYPE_FILETIME                      => "filetime",
         TDH_INTYPE_SYSTEMTIME                    => "systemtime",
@@ -765,151 +647,23 @@ fn intype_to_type_name(in_type: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── scan_ansi_string ────────────────────────────────────────────
-
-    #[test]
-    fn scan_ansi_empty() {
-        assert_eq!(scan_ansi_string(&[]), 0);
-    }
+    use super::super::abi::EVENT_HEADER_EXTENDED_DATA_ITEM;
 
     #[test]
-    fn scan_ansi_null_only() {
-        assert_eq!(scan_ansi_string(&[0]), 1);
+    fn type_name_scalars() {
+        assert_eq!(intype_to_type_name(TDH_INTYPE_INT8), "s8");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_UINT32), "u32");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_DOUBLE), "double");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_GUID), "guid");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_UNICODESTRING), "wstring");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_ANSISTRING), "string");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_BINARY), "binary");
+        assert_eq!(intype_to_type_name(999), "unsupported");
     }
-
-    #[test]
-    fn scan_ansi_hello() {
-        // "Hi\0rest"
-        let data = b"Hi\0rest";
-        assert_eq!(scan_ansi_string(data), 3); // 'H','i','\0'
-    }
-
-    #[test]
-    fn scan_ansi_unterminated() {
-        let data = b"abc";
-        assert_eq!(scan_ansi_string(data), 3);
-    }
-
-    // ── scan_utf16_string ───────────────────────────────────────────
-
-    #[test]
-    fn scan_utf16_empty() {
-        assert_eq!(scan_utf16_string(&[]), 0);
-    }
-
-    #[test]
-    fn scan_utf16_null_only() {
-        assert_eq!(scan_utf16_string(&[0, 0]), 2);
-    }
-
-    #[test]
-    fn scan_utf16_hello() {
-        // "Hi" in UTF-16LE + null terminator
-        let data: &[u8] = &[b'H', 0, b'i', 0, 0, 0, b'X', 0];
-        assert_eq!(scan_utf16_string(data), 6); // 'H',0,'i',0,0,0
-    }
-
-    #[test]
-    fn scan_utf16_unterminated() {
-        let data: &[u8] = &[b'A', 0, b'B', 0];
-        assert_eq!(scan_utf16_string(data), 4);
-    }
-
-    #[test]
-    fn scan_utf16_odd_length() {
-        // Odd byte count — no valid null terminator pair
-        let data: &[u8] = &[b'A', 0, b'B'];
-        assert_eq!(scan_utf16_string(data), 3);
-    }
-
-    // ── build_event_format_with_data ────────────────────────────────
-
-    #[test]
-    fn format_all_fixed() {
-        let props = vec![
-            CachedProperty { name: "a".into(), type_name: "u32", kind: PropertyKind::Fixed(4) },
-            CachedProperty { name: "b".into(), type_name: "u64", kind: PropertyKind::Fixed(8) },
-        ];
-        let data = [0u8; 12];
-        let fmt = build_event_format_with_data(&props, &data);
-        let fields = fmt.fields();
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].name, "a");
-        assert_eq!(fields[0].offset, 0);
-        assert_eq!(fields[0].size, 4);
-        assert_eq!(fields[1].name, "b");
-        assert_eq!(fields[1].offset, 4);
-        assert_eq!(fields[1].size, 8);
-    }
-
-    #[test]
-    fn format_with_ansi_string() {
-        let props = vec![
-            CachedProperty { name: "id".into(), type_name: "u32", kind: PropertyKind::Fixed(4) },
-            CachedProperty { name: "msg".into(), type_name: "string", kind: PropertyKind::AnsiString },
-            CachedProperty { name: "val".into(), type_name: "u16", kind: PropertyKind::Fixed(2) },
-        ];
-        // id=0x01020304, msg="Hi\0", val=0x0506
-        let data: Vec<u8> = vec![
-            0x01, 0x02, 0x03, 0x04,  // id
-            b'H', b'i', 0x00,        // msg (null-terminated)
-            0x05, 0x06,              // val
-        ];
-        let fmt = build_event_format_with_data(&props, &data);
-        let fields = fmt.fields();
-        assert_eq!(fields.len(), 3);
-        assert_eq!(fields[0].offset, 0);
-        assert_eq!(fields[0].size, 4);
-        assert_eq!(fields[1].offset, 4);
-        assert_eq!(fields[1].size, 3); // "Hi\0"
-        assert_eq!(fields[2].offset, 7);
-        assert_eq!(fields[2].size, 2);
-    }
-
-    #[test]
-    fn format_with_utf16_string() {
-        let props = vec![
-            CachedProperty { name: "name".into(), type_name: "wstring", kind: PropertyKind::Utf16String },
-            CachedProperty { name: "code".into(), type_name: "u32", kind: PropertyKind::Fixed(4) },
-        ];
-        // name="A\0" in UTF-16LE (A=0x41,0x00 then null=0x00,0x00), code=0x01020304
-        let data: Vec<u8> = vec![
-            0x41, 0x00, 0x00, 0x00,  // "A\0" in UTF-16LE
-            0x01, 0x02, 0x03, 0x04,  // code
-        ];
-        let fmt = build_event_format_with_data(&props, &data);
-        let fields = fmt.fields();
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].offset, 0);
-        assert_eq!(fields[0].size, 4); // 'A',0x00, 0x00,0x00
-        assert_eq!(fields[1].offset, 4);
-        assert_eq!(fields[1].size, 4);
-    }
-
-    #[test]
-    fn format_variable_blob_consumes_rest() {
-        let props = vec![
-            CachedProperty { name: "hdr".into(), type_name: "u8", kind: PropertyKind::Fixed(1) },
-            CachedProperty { name: "blob".into(), type_name: "binary", kind: PropertyKind::VariableBlob },
-        ];
-        let data = [0u8; 10];
-        let fmt = build_event_format_with_data(&props, &data);
-        let fields = fmt.fields();
-        assert_eq!(fields[0].size, 1);
-        assert_eq!(fields[1].offset, 1);
-        assert_eq!(fields[1].size, 9); // everything after hdr
-    }
-
-    // ── read_utf16_at ───────────────────────────────────────────────
 
     #[test]
     fn read_utf16_at_basic() {
-        // "AB\0" in UTF-16LE at offset 2
-        let buf: Vec<u8> = vec![
-            0xFF, 0xFF,              // junk before
-            b'A', 0, b'B', 0, 0, 0, // "AB\0"
-        ];
+        let buf: Vec<u8> = vec![0xFF, 0xFF, b'A', 0, b'B', 0, 0, 0];
         assert_eq!(read_utf16_at(&buf, 2), "AB");
     }
 
@@ -923,73 +677,243 @@ mod tests {
         assert_eq!(read_utf16_at(&[0x41, 0x00], 100), "");
     }
 
-    // ── scan_counted_string ─────────────────────────────────────────
+    // ── End-to-end TDH integration tests ────────────────────────────
 
-    #[test]
-    fn scan_counted_empty() {
-        assert_eq!(scan_counted_string(&[]), 0);
+    /// TL InType constants (same as TDH_INTYPE_* values).
+    const TL_UINT32: u8 = 8;
+    const TL_UINT64: u8 = 10;
+    const TL_DOUBLE: u8 = 12;
+    const TL_ANSISTRING: u8 = 2;
+    const TL_UNICODESTRING: u8 = 1;
+
+    /// Builds a TraceLogging schema metadata blob.
+    fn build_tl_schema(
+        provider_name: &str,
+        event_name: &str,
+        fields: &[(&str, u8)],
+    ) -> Vec<u8> {
+        let mut blob = Vec::new();
+        let prov_size = 2u16 + provider_name.len() as u16 + 1;
+        blob.extend_from_slice(&prov_size.to_le_bytes());
+        blob.extend_from_slice(provider_name.as_bytes());
+        blob.push(0);
+        let mut event_body_len: usize = 1 + event_name.len() + 1;
+        for (name, _) in fields {
+            event_body_len += name.len() + 1 + 1;
+        }
+        let event_size = 2u16 + event_body_len as u16;
+        blob.extend_from_slice(&event_size.to_le_bytes());
+        blob.push(0);
+        blob.extend_from_slice(event_name.as_bytes());
+        blob.push(0);
+        for (name, intype) in fields {
+            blob.extend_from_slice(name.as_bytes());
+            blob.push(0);
+            blob.push(*intype);
+        }
+        blob
+    }
+
+    const EXT_TYPE_PROV_TRAITS: u16 = 12;
+
+    fn build_test_record(
+        prov_blob: &[u8],
+        event_blob: &[u8],
+        ext_items: &mut [EVENT_HEADER_EXTENDED_DATA_ITEM; 2],
+        user_data: &[u8],
+    ) -> EVENT_RECORD {
+        ext_items[0] = unsafe { std::mem::zeroed() };
+        ext_items[0].ExtType = EXT_TYPE_PROV_TRAITS;
+        ext_items[0].DataSize = prov_blob.len() as u16;
+        ext_items[0].DataPtr = prov_blob.as_ptr() as u64;
+        ext_items[1] = unsafe { std::mem::zeroed() };
+        ext_items[1].ExtType = EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL as u16;
+        ext_items[1].DataSize = event_blob.len() as u16;
+        ext_items[1].DataPtr = event_blob.as_ptr() as u64;
+        let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        record.ExtendedDataCount = 2;
+        record.ExtendedData = ext_items.as_mut_ptr();
+        record.UserData = user_data.as_ptr() as *mut std::ffi::c_void;
+        record.UserDataLength = user_data.len() as u16;
+        record
+    }
+
+    fn split_tl_schema(blob: &[u8]) -> (&[u8], &[u8]) {
+        let prov_size = u16::from_le_bytes([blob[0], blob[1]]) as usize;
+        (&blob[..prov_size], &blob[prov_size..])
     }
 
     #[test]
-    fn scan_counted_short() {
-        // Only 1 byte — not enough for the u16 prefix
-        assert_eq!(scan_counted_string(&[0x03]), 1);
-    }
+    fn tdh_decode_single_u32() {
+        let schema = build_tl_schema("TestProvider", "SingleU32", &[
+            ("ProcessId", TL_UINT32),
+        ]);
+        let (prov, evt) = split_tl_schema(&schema);
+        let user_data: Vec<u8> = 42u32.to_le_bytes().to_vec();
+        let mut ext_items: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record = build_test_record(prov, evt, &mut ext_items, &user_data);
 
-    #[test]
-    fn scan_counted_hello() {
-        // len=5, data="Hello", trailing byte
-        let data: &[u8] = &[0x05, 0x00, b'H', b'e', b'l', b'l', b'o', 0xFF];
-        assert_eq!(scan_counted_string(data), 7); // 2 + 5
-    }
+        let mut decoder = TdhDecoder::new();
+        let event_data = decoder.decode(&record).expect("decode should succeed");
 
-    #[test]
-    fn scan_counted_zero_len() {
-        // len=0, no data
-        assert_eq!(scan_counted_string(&[0x00, 0x00, 0xFF]), 2);
-    }
-
-    #[test]
-    fn scan_counted_truncated() {
-        // len=10 but only 4 bytes available after prefix
-        let data: &[u8] = &[0x0A, 0x00, 0x01, 0x02, 0x03, 0x04];
-        assert_eq!(scan_counted_string(data), 6); // clamped to data.len()
-    }
-
-    // ── format with counted string ──────────────────────────────────
-
-    #[test]
-    fn format_with_counted_string() {
-        let props = vec![
-            CachedProperty { name: "status".into(), type_name: "counted_string", kind: PropertyKind::CountedString },
-            CachedProperty { name: "code".into(), type_name: "u32", kind: PropertyKind::Fixed(4) },
-        ];
-        // status: len=7 "Success", code: 0x01020304
-        let data: Vec<u8> = vec![
-            0x07, 0x00,                                     // u16 len = 7
-            b'S', b'u', b'c', b'c', b'e', b's', b's',      // "Success"
-            0x01, 0x02, 0x03, 0x04,                          // code
-        ];
-        let fmt = build_event_format_with_data(&props, &data);
-        let fields = fmt.fields();
-        assert_eq!(fields.len(), 2);
+        let fields = event_data.format().fields();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].size, 4);
         assert_eq!(fields[0].offset, 0);
-        assert_eq!(fields[0].size, 9);  // 2 + 7
-        assert_eq!(fields[1].offset, 9);
-        assert_eq!(fields[1].size, 4);
+        assert_eq!(fields[0].location, LocationType::Static);
     }
 
-    // ── intype_to_type_name ─────────────────────────────────────────
+    #[test]
+    fn tdh_decode_multiple_scalars() {
+        let schema = build_tl_schema("TestProvider", "MultiScalar", &[
+            ("Code", TL_UINT32),
+            ("Value", TL_DOUBLE),
+            ("Count", TL_UINT64),
+        ]);
+        let mut user_data = Vec::new();
+        user_data.extend_from_slice(&100u32.to_le_bytes());
+        user_data.extend_from_slice(&3.14f64.to_le_bytes());
+        user_data.extend_from_slice(&999u64.to_le_bytes());
+
+        let (prov, evt) = split_tl_schema(&schema);
+        let mut ext_items: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record = build_test_record(prov, evt, &mut ext_items, &user_data);
+
+        let mut decoder = TdhDecoder::new();
+        let event_data = decoder.decode(&record).expect("decode should succeed");
+
+        let fields = event_data.format().fields();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "Code");
+        assert_eq!(fields[0].offset, 0);
+        assert_eq!(fields[0].size, 4);
+        assert_eq!(fields[1].name, "Value");
+        assert_eq!(fields[1].offset, 4);
+        assert_eq!(fields[1].size, 8);
+        assert_eq!(fields[2].name, "Count");
+        assert_eq!(fields[2].offset, 12);
+        assert_eq!(fields[2].size, 8);
+    }
 
     #[test]
-    fn type_name_scalars() {
-        assert_eq!(intype_to_type_name(TDH_INTYPE_INT8), "s8");
-        assert_eq!(intype_to_type_name(TDH_INTYPE_UINT32), "u32");
-        assert_eq!(intype_to_type_name(TDH_INTYPE_DOUBLE), "f64");
-        assert_eq!(intype_to_type_name(TDH_INTYPE_GUID), "guid");
-        assert_eq!(intype_to_type_name(TDH_INTYPE_UNICODESTRING), "wstring");
-        assert_eq!(intype_to_type_name(TDH_INTYPE_ANSISTRING), "string");
-        assert_eq!(intype_to_type_name(TDH_INTYPE_BINARY), "binary");
-        assert_eq!(intype_to_type_name(999), "unsupported");
+    fn tdh_decode_with_ansi_string() {
+        let schema = build_tl_schema("TestProvider", "WithString", &[
+            ("Id", TL_UINT32),
+            ("Message", TL_ANSISTRING),
+            ("Flags", TL_UINT32),
+        ]);
+        let mut user_data = Vec::new();
+        user_data.extend_from_slice(&7u32.to_le_bytes());
+        user_data.extend_from_slice(b"Hello\0");
+        user_data.extend_from_slice(&0xFFu32.to_le_bytes());
+
+        let (prov, evt) = split_tl_schema(&schema);
+        let mut ext_items: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record = build_test_record(prov, evt, &mut ext_items, &user_data);
+
+        let mut decoder = TdhDecoder::new();
+        let event_data = decoder.decode(&record).expect("decode should succeed");
+
+        let fields = event_data.format().fields();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "Id");
+        assert_eq!(fields[0].offset, 0);
+        assert_eq!(fields[0].size, 4);
+        assert_eq!(fields[0].location, LocationType::Static);
+        // Message: variable-length string with size = 0
+        assert_eq!(fields[1].name, "Message");
+        assert_eq!(fields[1].offset, 4);
+        assert_eq!(fields[1].size, 0);
+        assert_eq!(fields[1].location, LocationType::StaticString);
+        // Flags: after a variable field, offset = 0
+        assert_eq!(fields[2].name, "Flags");
+        assert_eq!(fields[2].offset, 0);
+        assert_eq!(fields[2].size, 4);
+
+        // Verify the framework's lazy resolution works: read the Message
+        // field using try_get_field_data_closure.
+        let format = event_data.format();
+        let mut msg_closure = format.try_get_field_data_closure("Message")
+            .expect("should produce closure for Message");
+        let msg_bytes = msg_closure(event_data.event_data());
+        assert_eq!(msg_bytes, b"Hello");
+
+        // Read the Flags field (after the variable string)
+        let mut flags_closure = format.try_get_field_data_closure("Flags")
+            .expect("should produce closure for Flags");
+        let flags_bytes = flags_closure(event_data.event_data());
+        assert_eq!(flags_bytes, &0xFFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn tdh_decode_with_unicode_string() {
+        let schema = build_tl_schema("TestProvider", "WithWString", &[
+            ("Name", TL_UNICODESTRING),
+            ("Code", TL_UINT32),
+        ]);
+        let mut user_data = Vec::new();
+        user_data.extend_from_slice(&[b'A', 0, b'B', 0, 0, 0]); // "AB\0" UTF-16LE
+        user_data.extend_from_slice(&42u32.to_le_bytes());
+
+        let (prov, evt) = split_tl_schema(&schema);
+        let mut ext_items: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record = build_test_record(prov, evt, &mut ext_items, &user_data);
+
+        let mut decoder = TdhDecoder::new();
+        let event_data = decoder.decode(&record).expect("decode should succeed");
+
+        let fields = event_data.format().fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "Name");
+        assert_eq!(fields[0].size, 0); // variable
+        assert_eq!(fields[0].location, LocationType::StaticUTF16String);
+        assert_eq!(fields[1].name, "Code");
+        assert_eq!(fields[1].offset, 0); // after variable field
+
+        // Verify lazy resolution
+        let format = event_data.format();
+        let mut name_closure = format.try_get_field_data_closure("Name")
+            .expect("should produce closure for Name");
+        let name_bytes = name_closure(event_data.event_data());
+        // StaticUTF16String returns bytes up to (not including) the null
+        assert_eq!(name_bytes, &[b'A', 0, b'B', 0]);
+    }
+
+    #[test]
+    fn tdh_decode_event_name() {
+        let schema = build_tl_schema("MyProvider", "ImportantEvent", &[
+            ("X", TL_UINT32),
+        ]);
+        let (prov, evt) = split_tl_schema(&schema);
+        let user_data = 1u32.to_le_bytes();
+        let mut ext_items: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record = build_test_record(prov, evt, &mut ext_items, &user_data);
+
+        let mut decoder = TdhDecoder::new();
+        let _ = decoder.decode(&record).expect("decode should succeed");
+        let name = decoder.event_name(&record);
+        assert_eq!(name, Some("ImportantEvent"));
+    }
+
+    #[test]
+    fn tdh_decode_schema_cache_reuse() {
+        let schema = build_tl_schema("TestProvider", "Cached", &[
+            ("Val", TL_UINT32),
+        ]);
+        let (prov, evt) = split_tl_schema(&schema);
+
+        let user_data_1 = 111u32.to_le_bytes();
+        let mut ext_items_1: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record_1 = build_test_record(prov, evt, &mut ext_items_1, &user_data_1);
+
+        let mut decoder = TdhDecoder::new();
+        let ed1 = decoder.decode(&record_1).expect("first decode");
+        assert_eq!(ed1.format().fields()[0].size, 4);
+
+        let user_data_2 = 222u32.to_le_bytes();
+        let mut ext_items_2: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record_2 = build_test_record(prov, evt, &mut ext_items_2, &user_data_2);
+        let ed2 = decoder.decode(&record_2).expect("second decode (cached)");
+        assert_eq!(ed2.format().fields()[0].size, 4);
     }
 }
