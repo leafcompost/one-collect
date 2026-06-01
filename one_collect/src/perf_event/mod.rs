@@ -3,6 +3,8 @@
 
 use std::fs::File;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
 use std::time::Duration;
 use std::array::TryFromSliceError;
 use std::collections::{HashSet, HashMap};
@@ -218,6 +220,13 @@ pub trait PerfDataSource {
     fn end_reading(&mut self);
 
     fn more(&self) -> bool;
+
+    /// Borrow the per-CPU perf file descriptors owned by this source,
+    /// paired with their CPU index. Returns an empty list for sources
+    /// that do not expose per-CPU perf fds (for example, mock or
+    /// in-process sources).
+    #[cfg(target_os = "linux")]
+    fn perf_fds(&self) -> Vec<(u32, BorrowedFd<'_>)> { Vec::new() }
 
     /// Take the in-process ring buffer writer for use by capture_environment.
     /// Returns None if no in-process ring buffer is available.
@@ -514,6 +523,35 @@ impl PerfSession {
         &mut self,
         timeout: Duration) {
         self.read_timeout = timeout;
+    }
+
+    /// Borrow the per-CPU perf file descriptors backing this session,
+    /// paired with their CPU index.
+    ///
+    /// Intended for consumers that want to wait on the perf fds directly
+    /// (for example via `epoll(2)` or `tokio::io::unix::AsyncFd`) instead
+    /// of relying on the built-in poll/sleep read loop. Pair this with
+    /// [`RingBufSessionBuilder::with_wakeup_watermark`]
+    /// to control how often the kernel marks the fds readable.
+    ///
+    /// Consumers using this with an async runtime (for example a
+    /// single-threaded Tokio `current_thread` runtime) must also call
+    /// [`Self::set_read_timeout`] with `Duration::ZERO`. The drain
+    /// methods ([`Self::parse_all`], [`Self::parse_for_duration`],
+    /// [`Self::parse_until`]) internally call
+    /// `std::thread::sleep(read_timeout)` when the ring is drained,
+    /// which would block the runtime thread and starve every other
+    /// task on it. With `read_timeout = 0` that sleep becomes a no-op
+    /// syscall and the consumer should drive successive drains from
+    /// fd readiness rather than from the drain method itself.
+    ///
+    /// Returned `BorrowedFd`s are tied to `&self`, so the session must
+    /// outlive any consumer that uses them. Sources that do not expose
+    /// per-CPU perf fds (mock or in-process sources) return an empty
+    /// list.
+    #[cfg(target_os = "linux")]
+    pub fn perf_fds(&self) -> Vec<(u32, BorrowedFd<'_>)> {
+        self.source.perf_fds()
     }
 
     pub(crate) const fn capture_env_options_mut(&mut self) -> &mut CaptureEnvironmentOptions {
@@ -1458,6 +1496,17 @@ mod tests {
 
         assert!(mock.read(timeout).is_none());
         assert!(!mock.more());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perf_fds_empty_for_mock_source() {
+        /* The default PerfDataSource::perf_fds() impl returns an empty
+         * list; sources that don't manage per-CPU perf fds (such as
+         * MockData) must inherit that behavior. */
+        let mock = MockData::new(0, 0);
+        let session = PerfSession::new(Box::new(mock));
+        assert!(session.perf_fds().is_empty());
     }
 
     #[test]
