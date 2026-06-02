@@ -1166,10 +1166,11 @@ impl EventFormat {
                 }
 
                 match type_name {
-                    "u8" | "s8" | "char" | "counted_string" => Some(1),
-                    "u16" | "s16" | "short" => Some(2),
-                    "u32" | "s32" | "int" => Some(4),
-                    "u64" | "s64" | "long" => Some(8),
+                    "u8" | "s8" | "char" | "counted_string"
+                    | "string" | "wstring"                   => Some(1),
+                    "u16" | "s16" | "short"                  => Some(2),
+                    "u32" | "s32" | "int"                    => Some(4),
+                    "u64" | "s64" | "long"                   => Some(8),
                     _ => { None },
                 }
             },
