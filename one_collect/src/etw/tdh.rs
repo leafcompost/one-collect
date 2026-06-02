@@ -164,6 +164,21 @@ impl SchemaCache {
 
 // ── TdhDecoder ──────────────────────────────────────────────────────
 
+/// Result of a successful [`TdhDecoder::decode`] call.
+///
+/// Wraps the decoded [`EventData`] together with a flag indicating
+/// whether this was the first time the schema was seen (cache miss).
+/// Callers can use `is_new_schema` to register the [`EventFormat`]
+/// with an exporter exactly once.
+pub struct DecodeResult<'a> {
+    /// The decoded event data.
+    pub event_data: EventData<'a>,
+    /// `true` when this is the first time this schema has been seen
+    /// (cache miss).  Exporters can use this to register the
+    /// `EventFormat` for a unique ID without checking every event.
+    pub is_new_schema: bool,
+}
+
 /// Runtime decoder for TraceLogging / TraceLoggingDynamic ETW events.
 ///
 /// Caches the `EventFormat` directly per schema.  Cache hits are a
@@ -196,20 +211,21 @@ impl TdhDecoder {
         }
     }
 
-    /// Decodes an `EVENT_RECORD` into an [`EventData`].
+    /// Decodes an `EVENT_RECORD` into a [`DecodeResult`].
     ///
-    /// The returned `EventData` references the cached `EventFormat`
-    /// (schema-stable).  Consumers use the framework's standard
-    /// `try_get_field_data_closure` to resolve individual field values
-    /// lazily against the event's `user_data` payload.
+    /// The returned [`DecodeResult`] contains the decoded
+    /// [`EventData`] together with `is_new_schema`, which is `true`
+    /// when this schema was seen for the first time (cache miss).
+    /// Exporters can use this flag to register the [`EventFormat`]
+    /// for a unique ID without checking on every event.
     pub fn decode<'a>(
         &'a mut self,
         record: &'a EVENT_RECORD,
-    ) -> Result<EventData<'a>, TdhDecodeError> {
+    ) -> Result<DecodeResult<'a>, TdhDecodeError> {
         let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
         let schema_tl_bytes = find_schema_tl(record)?;
 
-        if self.cache.get(schema_tl_bytes, is_32bit).is_none() {
+        let is_new_schema = if self.cache.get(schema_tl_bytes, is_32bit).is_none() {
             call_tdh_get_event_information(record, &mut self.tei_buf)?;
             let schema = build_cached_schema(self.tei_buf.as_bytes(), is_32bit)?;
             debug!(
@@ -219,7 +235,11 @@ impl TdhDecoder {
                 "TDH schema cache miss — new schema cached"
             );
             self.cache.insert(schema_tl_bytes.to_vec(), is_32bit, schema);
-        }
+            true
+        } else {
+            false
+        };
+
         let schema = self.cache.get(schema_tl_bytes, is_32bit)
             .expect("just inserted");
 
@@ -229,7 +249,10 @@ impl TdhDecoder {
             field_count = schema.format.fields().len(),
             "TDH decode — user_data"
         );
-        Ok(EventData::new(user_data, user_data, &schema.format))
+        Ok(DecodeResult {
+            event_data: EventData::new(user_data, user_data, &schema.format),
+            is_new_schema,
+        })
     }
 }
 
@@ -801,9 +824,10 @@ mod tests {
         let record = build_test_record(prov, evt, &mut ext_items, &user_data);
 
         let mut decoder = TdhDecoder::new();
-        let event_data = decoder.decode(&record).expect("decode should succeed");
+        let result = decoder.decode(&record).expect("decode should succeed");
+        assert!(result.is_new_schema);
 
-        let fields = event_data.format().fields();
+        let fields = result.event_data.format().fields();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].size, 4);
         assert_eq!(fields[0].offset, 0);
@@ -827,7 +851,8 @@ mod tests {
         let record = build_test_record(prov, evt, &mut ext_items, &user_data);
 
         let mut decoder = TdhDecoder::new();
-        let event_data = decoder.decode(&record).expect("decode should succeed");
+        let result = decoder.decode(&record).expect("decode should succeed");
+        let event_data = &result.event_data;
 
         let fields = event_data.format().fields();
         assert_eq!(fields.len(), 3);
@@ -859,7 +884,8 @@ mod tests {
         let record = build_test_record(prov, evt, &mut ext_items, &user_data);
 
         let mut decoder = TdhDecoder::new();
-        let event_data = decoder.decode(&record).expect("decode should succeed");
+        let result = decoder.decode(&record).expect("decode should succeed");
+        let event_data = &result.event_data;
 
         let fields = event_data.format().fields();
         assert_eq!(fields.len(), 3);
@@ -907,7 +933,8 @@ mod tests {
         let record = build_test_record(prov, evt, &mut ext_items, &user_data);
 
         let mut decoder = TdhDecoder::new();
-        let event_data = decoder.decode(&record).expect("decode should succeed");
+        let result = decoder.decode(&record).expect("decode should succeed");
+        let event_data = &result.event_data;
 
         let fields = event_data.format().fields();
         assert_eq!(fields.len(), 2);
@@ -954,13 +981,15 @@ mod tests {
         let record_1 = build_test_record(prov, evt, &mut ext_items_1, &user_data_1);
 
         let mut decoder = TdhDecoder::new();
-        let ed1 = decoder.decode(&record_1).expect("first decode");
-        assert_eq!(ed1.format().fields()[0].size, 4);
+        let r1 = decoder.decode(&record_1).expect("first decode");
+        assert!(r1.is_new_schema);
+        assert_eq!(r1.event_data.format().fields()[0].size, 4);
 
         let user_data_2 = 222u32.to_le_bytes();
         let mut ext_items_2: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
         let record_2 = build_test_record(prov, evt, &mut ext_items_2, &user_data_2);
-        let ed2 = decoder.decode(&record_2).expect("second decode (cached)");
-        assert_eq!(ed2.format().fields()[0].size, 4);
+        let r2 = decoder.decode(&record_2).expect("second decode (cached)");
+        assert!(!r2.is_new_schema);
+        assert_eq!(r2.event_data.format().fields()[0].size, 4);
     }
 }
