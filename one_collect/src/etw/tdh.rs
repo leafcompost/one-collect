@@ -71,12 +71,17 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     TDH_INTYPE_SID,
     TDH_INTYPE_HEXINT32,
     TDH_INTYPE_HEXINT64,
+    TDH_INTYPE_COUNTEDSTRING,
+    TDH_INTYPE_COUNTEDANSISTRING,
+    TDH_INTYPE_REVERSEDCOUNTEDSTRING,
+    TDH_INTYPE_REVERSEDCOUNTEDANSISTRING,
+    TDH_INTYPE_NONNULLTERMINATEDSTRING,
+    TDH_INTYPE_NONNULLTERMINATEDANSISTRING,
 
     // PROPERTY_FLAGS enum values used in EVENT_PROPERTY_INFO::Flags.
     PropertyStruct,
     PropertyParamLength,
     PropertyParamCount,
-    PropertyParamFixedLength,
 };
 
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND};
@@ -86,10 +91,9 @@ const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
 
 // Aliases for PROPERTY_FLAGS constants (i32 in windows-sys) to keep
 // call-site flag checks concise.
-const PROPERTY_STRUCT: i32             = PropertyStruct;
-const PROPERTY_PARAM_LENGTH: i32       = PropertyParamLength;
-const PROPERTY_PARAM_COUNT: i32        = PropertyParamCount;
-const PROPERTY_PARAM_FIXED_LENGTH: i32 = PropertyParamFixedLength;
+const PROPERTY_STRUCT: i32       = PropertyStruct;
+const PROPERTY_PARAM_LENGTH: i32 = PropertyParamLength;
+const PROPERTY_PARAM_COUNT: i32  = PropertyParamCount;
 
 // EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL is imported from windows-sys
 // (u32 = 11).  Usage sites cast to u16 where the ExtType field requires it.
@@ -356,20 +360,7 @@ fn walk_properties(
         // ── Struct property ─────────────────────────────────────────
         if (flags & PROPERTY_STRUCT) != 0 {
             if depth >= MAX_STRUCT_DEPTH {
-                warn!(
-                    field = %qualified_name,
-                    depth,
-                    max = MAX_STRUCT_DEPTH,
-                    "struct nesting depth exceeded — truncating sub-fields"
-                );
-                // Emit a placeholder that consumes remaining bytes.
-                let offset = if *seen_variable { 0 } else { *running_offset };
-                format.add_field(EventField::new(
-                    qualified_name, "unsupported".to_string(),
-                    LocationType::Static, offset, 0,
-                ));
-                *seen_variable = true;
-                continue;
+                return Err(TdhDecodeError::Malformed("struct nesting depth exceeded"));
             }
             let struct_info = unsafe { prop.Anonymous1.structType };
             let start = struct_info.StructStartIndex as usize;
@@ -422,17 +413,16 @@ fn walk_properties(
         // strings), never use the TDH-reported length as a fixed size because
         // it is per-event and the schema is cached.  Force these through the
         // dynamic LocationType path instead.
-        // The `_TDH_IN_TYPE` enum was extended between SDK versions,
-        // shifting the numeric values for the 300+ string constants.
-        // The windows-sys crate's constants may not match the values
-        // the runtime TDH API returns on a given Windows build.
-        // We use an integer range (300..=305) so that every possible
-        // assignment — old SDK or new SDK — is covered.
         let is_variable_intype = matches!(
             in_type,
-            TDH_INTYPE_UNICODESTRING      // 1
-            | TDH_INTYPE_ANSISTRING       // 2
-            | 300..=305                   // extended string types (all versions)
+            TDH_INTYPE_UNICODESTRING
+            | TDH_INTYPE_ANSISTRING
+            | TDH_INTYPE_COUNTEDSTRING
+            | TDH_INTYPE_COUNTEDANSISTRING
+            | TDH_INTYPE_REVERSEDCOUNTEDSTRING
+            | TDH_INTYPE_REVERSEDCOUNTEDANSISTRING
+            | TDH_INTYPE_NONNULLTERMINATEDSTRING
+            | TDH_INTYPE_NONNULLTERMINATEDANSISTRING
         );
 
         let explicit_len: Option<usize> = if is_variable_intype {
@@ -464,68 +454,7 @@ fn walk_properties(
         }
 
         // Map TDH in-type to the framework's LocationType + size.
-        let (type_name, loc, size) = match in_type {
-            // Fixed-size scalars
-            TDH_INTYPE_INT8                          => ("s8",   LocationType::Static, 1),
-            TDH_INTYPE_UINT8 | TDH_INTYPE_BOOLEAN   => ("u8",   LocationType::Static, 1),
-            TDH_INTYPE_INT16                         => ("s16",  LocationType::Static, 2),
-            TDH_INTYPE_UINT16                        => ("u16",  LocationType::Static, 2),
-            TDH_INTYPE_INT32 | TDH_INTYPE_HEXINT32  => ("s32",  LocationType::Static, 4),
-            TDH_INTYPE_UINT32                        => ("u32",  LocationType::Static, 4),
-            TDH_INTYPE_INT64 | TDH_INTYPE_HEXINT64  => ("s64",  LocationType::Static, 8),
-            TDH_INTYPE_UINT64                        => ("u64",  LocationType::Static, 8),
-            TDH_INTYPE_FLOAT                         => ("float", LocationType::Static, 4),
-            TDH_INTYPE_DOUBLE                        => ("double", LocationType::Static, 8),
-            TDH_INTYPE_POINTER => {
-                let sz = if is_32bit { 4 } else { 8 };
-                ("pointer", LocationType::Static, sz)
-            }
-            TDH_INTYPE_FILETIME                      => ("filetime",   LocationType::Static, 8),
-            TDH_INTYPE_SYSTEMTIME                    => ("systemtime", LocationType::Static, 16),
-            TDH_INTYPE_GUID                          => ("guid",       LocationType::Static, 16),
-
-            // Variable-length: null-terminated strings → size = 0
-            TDH_INTYPE_ANSISTRING                    => ("string",  LocationType::StaticString, 0),
-            TDH_INTYPE_UNICODESTRING                 => ("wstring", LocationType::StaticUTF16String, 0),
-
-            // Extended string types (300+ range).
-            //
-            // The `_TDH_IN_TYPE` enum was extended between Windows SDK
-            // versions, inserting new ANSI variants and shifting the
-            // numeric values of existing entries.  The windows-sys crate
-            // constants may therefore disagree with the values the
-            // runtime TDH API actually returns.  We match on explicit
-            // integer literals so that every possible assignment — old
-            // SDK or new — is handled correctly.
-            //
-            // For TraceLogging events the payload strings are always
-            // null-terminated, so we decode them with null-terminated
-            // scanning (StaticUTF16String / StaticString).
-            //
-            // Old SDK:  300=Counted, 301=ReversedCounted,
-            //           302=NonNullTerm, 303=NonNullTermAnsi
-            // New SDK:  300=Counted, 301=CountedAnsi,
-            //           302=ReversedCounted, 303=ReversedCountedAnsi,
-            //           304=NonNullTerm, 305=NonNullTermAnsi
-            //
-            // Counted strings (2-byte length prefix + data bytes).
-            // We use type_name "wstring"/"string" (not "counted_string")
-            // so that the framework's write-closure renders the payload
-            // bytes as human-readable text rather than hex.
-            300                                      => ("wstring", LocationType::StaticLenPrefixArray, 0),
-            301                                      => ("string",  LocationType::StaticLenPrefixArray, 0),
-            // Reversed-counted strings: length is at the end, but for
-            // TraceLogging the payload is typically null-terminated so
-            // we fall back to null-scan as a safe approximation.
-            302 | 304                                => ("wstring", LocationType::StaticUTF16String, 0),
-            303 | 305                                => ("string",  LocationType::StaticString, 0),
-
-            // Variable-length: binary blobs, SID
-            TDH_INTYPE_SID | TDH_INTYPE_BINARY      => ("binary", LocationType::Static, 0),
-
-            // Unknown — treat as variable-length placeholder
-            _ => ("unsupported", LocationType::Static, 0),
-        };
+        let (type_name, loc, size) = intype_to_field_info(in_type, is_32bit);
 
         format.add_field(EventField::new(
             qualified_name, type_name.to_string(),
@@ -665,35 +594,63 @@ fn read_utf16_at(buf: &[u8], byte_offset: usize) -> String {
     String::from_utf16_lossy(&u16s)
 }
 
-/// Returns the type_name string for a TDH_INTYPE.
-fn intype_to_type_name(in_type: i32) -> &'static str {
+/// Maps a TDH in-type to `(type_name, LocationType, size)`.
+///
+/// This is the single source of truth for the in-type → field-info
+/// mapping, used by both `walk_properties` (schema construction) and
+/// `intype_to_type_name` (explicit-length fallback).
+fn intype_to_field_info(in_type: i32, is_32bit: bool) -> (&'static str, LocationType, usize) {
     match in_type {
-        TDH_INTYPE_INT8                          => "s8",
-        TDH_INTYPE_UINT8 | TDH_INTYPE_BOOLEAN   => "u8",
-        TDH_INTYPE_INT16                         => "s16",
-        TDH_INTYPE_UINT16                        => "u16",
-        TDH_INTYPE_INT32 | TDH_INTYPE_HEXINT32  => "s32",
-        TDH_INTYPE_UINT32                        => "u32",
-        TDH_INTYPE_INT64 | TDH_INTYPE_HEXINT64  => "s64",
-        TDH_INTYPE_UINT64                        => "u64",
-        TDH_INTYPE_FLOAT                         => "float",
-        TDH_INTYPE_DOUBLE                        => "double",
-        TDH_INTYPE_POINTER                       => "pointer",
-        TDH_INTYPE_FILETIME                      => "filetime",
-        TDH_INTYPE_SYSTEMTIME                    => "systemtime",
-        TDH_INTYPE_GUID                          => "guid",
-        TDH_INTYPE_SID                           => "sid",
-        TDH_INTYPE_UNICODESTRING                 => "wstring",
-        TDH_INTYPE_ANSISTRING                    => "string",
-        // Extended string types — see walk_properties for the full
-        // rationale on using integer literals here.
-        300                                      => "wstring",
-        301                                      => "string",
-        302 | 304                                => "wstring",
-        303 | 305                                => "string",
-        TDH_INTYPE_BINARY                        => "binary",
-        _                                        => "unsupported",
+        // Fixed-size scalars
+        TDH_INTYPE_INT8                          => ("s8",   LocationType::Static, 1),
+        TDH_INTYPE_UINT8 | TDH_INTYPE_BOOLEAN   => ("u8",   LocationType::Static, 1),
+        TDH_INTYPE_INT16                         => ("s16",  LocationType::Static, 2),
+        TDH_INTYPE_UINT16                        => ("u16",  LocationType::Static, 2),
+        TDH_INTYPE_INT32 | TDH_INTYPE_HEXINT32  => ("s32",  LocationType::Static, 4),
+        TDH_INTYPE_UINT32                        => ("u32",  LocationType::Static, 4),
+        TDH_INTYPE_INT64 | TDH_INTYPE_HEXINT64  => ("s64",  LocationType::Static, 8),
+        TDH_INTYPE_UINT64                        => ("u64",  LocationType::Static, 8),
+        TDH_INTYPE_FLOAT                         => ("float", LocationType::Static, 4),
+        TDH_INTYPE_DOUBLE                        => ("double", LocationType::Static, 8),
+        TDH_INTYPE_POINTER => {
+            let sz = if is_32bit { 4 } else { 8 };
+            ("pointer", LocationType::Static, sz)
+        }
+        TDH_INTYPE_FILETIME                      => ("filetime",   LocationType::Static, 8),
+        TDH_INTYPE_SYSTEMTIME                    => ("systemtime", LocationType::Static, 16),
+        TDH_INTYPE_GUID                          => ("guid",       LocationType::Static, 16),
+
+        // Variable-length: null-terminated strings → size = 0
+        TDH_INTYPE_ANSISTRING                    => ("string",  LocationType::StaticString, 0),
+        TDH_INTYPE_UNICODESTRING                 => ("wstring", LocationType::StaticUTF16String, 0),
+
+        // Counted strings (2-byte length prefix + content bytes).
+        TDH_INTYPE_COUNTEDSTRING                 => ("counted_wstring", LocationType::StaticLenPrefixArray, 0),
+        TDH_INTYPE_COUNTEDANSISTRING             => ("counted_string",  LocationType::StaticLenPrefixArray, 0),
+
+        // Reversed-counted strings (length at end of data).
+        // For TraceLogging the payload is typically null-terminated,
+        // so we fall back to null-scan as a safe approximation.
+        TDH_INTYPE_REVERSEDCOUNTEDSTRING         => ("wstring", LocationType::StaticUTF16String, 0),
+        TDH_INTYPE_REVERSEDCOUNTEDANSISTRING     => ("string",  LocationType::StaticString, 0),
+
+        // Non-null-terminated strings — scan for null as best effort.
+        TDH_INTYPE_NONNULLTERMINATEDSTRING       => ("wstring", LocationType::StaticUTF16String, 0),
+        TDH_INTYPE_NONNULLTERMINATEDANSISTRING   => ("string",  LocationType::StaticString, 0),
+
+        // Variable-length: binary blobs, SID
+        TDH_INTYPE_SID | TDH_INTYPE_BINARY      => ("binary", LocationType::Static, 0),
+
+        // Unknown — treat as variable-length placeholder
+        _ => ("unsupported", LocationType::Static, 0),
     }
+}
+
+/// Returns the type_name string for a TDH_INTYPE.
+///
+/// Delegates to [`intype_to_field_info`] and returns just the name.
+fn intype_to_type_name(in_type: i32) -> &'static str {
+    intype_to_field_info(in_type, false).0
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -716,19 +673,20 @@ mod tests {
     }
 
     /// Verify that the extended TDH_INTYPE values 300-305 are all
-    /// recognised as string types.  The runtime TDH on modern Windows
-    /// uses the new SDK enumeration where odd values (301, 303, 305)
-    /// are ANSI and even values (300, 302, 304) are UTF-16.
+    /// recognised as string types.  Per the windows-sys 0.59 constants,
+    /// odd values (301, 303, 305) are ANSI and even values (300, 302,
+    /// 304) are UTF-16.
     #[test]
     fn type_name_extended_strings() {
         // Counted string variants (2-byte length prefix)
-        assert_eq!(intype_to_type_name(300), "wstring"); // CountedString (UTF-16)
-        assert_eq!(intype_to_type_name(301), "string");  // CountedAnsiString
-        // Reversed-counted / non-null-terminated → null-scan fallback
-        assert_eq!(intype_to_type_name(302), "wstring"); // ReversedCountedString
-        assert_eq!(intype_to_type_name(304), "wstring"); // NonNullTerminatedString
-        assert_eq!(intype_to_type_name(303), "string");  // ReversedCountedAnsiString
-        assert_eq!(intype_to_type_name(305), "string");  // NonNullTerminatedAnsiString
+        assert_eq!(intype_to_type_name(TDH_INTYPE_COUNTEDSTRING), "counted_wstring");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_COUNTEDANSISTRING), "counted_string");
+        // Reversed-counted → null-scan fallback
+        assert_eq!(intype_to_type_name(TDH_INTYPE_REVERSEDCOUNTEDSTRING), "wstring");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_REVERSEDCOUNTEDANSISTRING), "string");
+        // Non-null-terminated → null-scan fallback
+        assert_eq!(intype_to_type_name(TDH_INTYPE_NONNULLTERMINATEDSTRING), "wstring");
+        assert_eq!(intype_to_type_name(TDH_INTYPE_NONNULLTERMINATEDANSISTRING), "string");
     }
 
     #[test]
