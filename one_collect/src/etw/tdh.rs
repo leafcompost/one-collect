@@ -174,9 +174,16 @@ impl SchemaCache {
 /// whether this was the first time the schema was seen (cache miss).
 /// Callers can use `is_new_schema` to register the [`EventFormat`]
 /// with an exporter exactly once.
-pub struct DecodeResult<'a> {
+#[non_exhaustive]
+pub struct TdhDecodedEvent<'a> {
     /// The decoded event data.
     pub event_data: EventData<'a>,
+    /// The TraceLogging event name, or `None` if the schema has no name.
+    ///
+    /// This is the primary identity for TraceLogging events (as opposed
+    /// to the event ID, which is often 0).  Consumers can use this for
+    /// OTEL log record naming without a second cache probe.
+    pub event_name: Option<&'a str>,
     /// `true` when this is the first time this schema has been seen
     /// (cache miss).  Exporters can use this to register the
     /// `EventFormat` for a unique ID without checking every event.
@@ -202,22 +209,9 @@ impl TdhDecoder {
         }
     }
 
-    /// Returns the cached event name for the given event's schema, or
-    /// `None` if the schema has not been seen yet or has no name.
-    pub fn event_name(&self, record: &EVENT_RECORD) -> Option<&str> {
-        let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
-        let schema_tl_bytes = find_schema_tl(record).ok()?;
-        let schema = self.cache.get(schema_tl_bytes, is_32bit)?;
-        if schema.event_name.is_empty() {
-            None
-        } else {
-            Some(&schema.event_name)
-        }
-    }
-
-    /// Decodes an `EVENT_RECORD` into a [`DecodeResult`].
+    /// Decodes an `EVENT_RECORD` into a [`TdhDecodedEvent`].
     ///
-    /// The returned [`DecodeResult`] contains the decoded
+    /// The returned [`TdhDecodedEvent`] contains the decoded
     /// [`EventData`] together with `is_new_schema`, which is `true`
     /// when this schema was seen for the first time (cache miss).
     /// Exporters can use this flag to register the [`EventFormat`]
@@ -225,7 +219,7 @@ impl TdhDecoder {
     pub fn decode<'a>(
         &'a mut self,
         record: &'a EVENT_RECORD,
-    ) -> Result<DecodeResult<'a>, TdhDecodeError> {
+    ) -> Result<TdhDecodedEvent<'a>, TdhDecodeError> {
         let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
         let schema_tl_bytes = find_schema_tl(record)?;
 
@@ -253,8 +247,15 @@ impl TdhDecoder {
             field_count = schema.format.fields().len(),
             "TDH decode — user_data"
         );
-        Ok(DecodeResult {
+        let event_name = if schema.event_name.is_empty() {
+            None
+        } else {
+            Some(schema.event_name.as_str())
+        };
+
+        Ok(TdhDecodedEvent {
             event_data: EventData::new(user_data, user_data, &schema.format),
+            event_name,
             is_new_schema,
         })
     }
@@ -348,7 +349,8 @@ fn walk_properties(
         }
 
         let prop = &properties[i];
-        let name = read_property_name(tei_buf, prop);
+        let raw_name = read_property_name(tei_buf, prop);
+        let name = if raw_name.is_empty() { std::format!("field{i}") } else { raw_name };
         let qualified_name = if prefix.is_empty() {
             name
         } else {
@@ -599,7 +601,7 @@ fn read_utf16_at(buf: &[u8], byte_offset: usize) -> String {
 /// This is the single source of truth for the in-type → field-info
 /// mapping, used by both `walk_properties` (schema construction) and
 /// `intype_to_type_name` (explicit-length fallback).
-fn intype_to_field_info(in_type: i32, is_32bit: bool) -> (&'static str, LocationType, usize) {
+const fn intype_to_field_info(in_type: i32, is_32bit: bool) -> (&'static str, LocationType, usize) {
     match in_type {
         // Fixed-size scalars
         TDH_INTYPE_INT8                          => ("s8",   LocationType::Static, 1),
@@ -649,7 +651,7 @@ fn intype_to_field_info(in_type: i32, is_32bit: bool) -> (&'static str, Location
 /// Returns the type_name string for a TDH_INTYPE.
 ///
 /// Delegates to [`intype_to_field_info`] and returns just the name.
-fn intype_to_type_name(in_type: i32) -> &'static str {
+const fn intype_to_type_name(in_type: i32) -> &'static str {
     intype_to_field_info(in_type, false).0
 }
 
@@ -922,9 +924,8 @@ mod tests {
         let record = build_test_record(prov, evt, &mut ext_items, &user_data);
 
         let mut decoder = TdhDecoder::new();
-        let _ = decoder.decode(&record).expect("decode should succeed");
-        let name = decoder.event_name(&record);
-        assert_eq!(name, Some("ImportantEvent"));
+        let result = decoder.decode(&record).expect("decode should succeed");
+        assert_eq!(result.event_name, Some("ImportantEvent"));
     }
 
     #[test]
@@ -949,5 +950,63 @@ mod tests {
         let r2 = decoder.decode(&record_2).expect("second decode (cached)");
         assert!(!r2.is_new_schema);
         assert_eq!(r2.event_data.format().fields()[0].size, 4);
+    }
+
+    #[test]
+    fn tdh_decode_not_found_without_schema_tl() {
+        // An EVENT_RECORD with no extended data items should return
+        // TdhDecodeError::NotFound — the public-API contract for
+        // manifest-based events or records without TraceLogging metadata.
+        let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        record.ExtendedDataCount = 0;
+        record.ExtendedData = std::ptr::null_mut();
+
+        let mut decoder = TdhDecoder::new();
+        match decoder.decode(&record) {
+            Err(TdhDecodeError::NotFound) => {} // expected
+            Err(other) => panic!("expected NotFound, got: {other}"),
+            Ok(_) => panic!("expected NotFound error, but decode succeeded"),
+        }
+    }
+
+    #[test]
+    fn tdh_decode_pointer_width_cache_split() {
+        // The same TL schema bytes under 32-bit and 64-bit headers
+        // must produce two distinct cache entries because pointer
+        // fields have different sizes (4 vs 8 bytes).
+        let schema = build_tl_schema("TestProvider", "PtrEvent", &[
+            ("Val", TL_UINT32),
+        ]);
+        let (prov, evt) = split_tl_schema(&schema);
+        let user_data = 1u32.to_le_bytes();
+
+        // 64-bit decode (default — flag not set)
+        let mut ext_items_64: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record_64 = build_test_record(prov, evt, &mut ext_items_64, &user_data);
+
+        let mut decoder = TdhDecoder::new();
+        let r64 = decoder.decode(&record_64).expect("64-bit decode");
+        assert!(r64.is_new_schema, "64-bit should be a cache miss");
+
+        // 32-bit decode (set EVENT_HEADER_FLAG_32_BIT_HEADER)
+        let mut ext_items_32: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let mut record_32 = build_test_record(prov, evt, &mut ext_items_32, &user_data);
+        record_32.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
+
+        let r32 = decoder.decode(&record_32).expect("32-bit decode");
+        assert!(r32.is_new_schema, "32-bit should also be a cache miss (separate cache)");
+
+        // Second 64-bit decode should hit the 64-bit cache
+        let mut ext_items_64b: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let record_64b = build_test_record(prov, evt, &mut ext_items_64b, &user_data);
+        let r64b = decoder.decode(&record_64b).expect("64-bit cache hit");
+        assert!(!r64b.is_new_schema, "64-bit should be a cache hit");
+
+        // Second 32-bit decode should hit the 32-bit cache
+        let mut ext_items_32b: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let mut record_32b = build_test_record(prov, evt, &mut ext_items_32b, &user_data);
+        record_32b.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
+        let r32b = decoder.decode(&record_32b).expect("32-bit cache hit");
+        assert!(!r32b.is_new_schema, "32-bit should be a cache hit");
     }
 }
