@@ -136,6 +136,8 @@ struct CachedSchema {
     /// fixed-size fields, and the framework's skip chain handles
     /// variable-length fields lazily via `size = 0`.
     format: EventFormat,
+    /// Monotonic ID assigned at insertion time.
+    schema_id: SchemaId,
 }
 
 /// Hash builder using XxHash64, matching the rest of the ETW module.
@@ -170,10 +172,9 @@ impl SchemaCache {
 
 /// Result of a successful [`TdhDecoder::decode`] call.
 ///
-/// Wraps the decoded [`EventData`] together with a flag indicating
-/// whether this was the first time the schema was seen (cache miss).
-/// Callers can use `is_new_schema` to register the [`EventFormat`]
-/// with an exporter exactly once.
+/// Contains the decoded [`EventData`], the TraceLogging `event_name`,
+/// and a monotonic [`SchemaId`] that exporters can use as a cheap
+/// lookup key for format registration.
 #[non_exhaustive]
 pub struct TdhDecodedEvent<'a> {
     /// The decoded event data.
@@ -184,11 +185,28 @@ pub struct TdhDecodedEvent<'a> {
     /// to the event ID, which is often 0).  Consumers can use this for
     /// OTEL log record naming without a second cache probe.
     pub event_name: Option<&'a str>,
-    /// `true` when this is the first time this schema has been seen
-    /// (cache miss).  Exporters can use this to register the
-    /// `EventFormat` for a unique ID without checking every event.
-    pub is_new_schema: bool,
+    /// Monotonic identifier for this event's schema.
+    ///
+    /// Each distinct `(schema_tl_bytes, pointer_width)` pair gets a unique
+    /// `SchemaId` on first insertion into the cache.  The same ID is
+    /// returned on every subsequent cache hit.  Exporters can use this as
+    /// a cheap lookup key to avoid re-registering the `EventFormat`:
+    ///
+    /// ```ignore
+    /// let event = decoder.decode(record)?;
+    /// let id = *my_map.entry(event.schema_id)
+    ///     .or_insert_with(|| exporter.register(event.event_data.format()));
+    /// ```
+    pub schema_id: SchemaId,
 }
+
+/// Opaque monotonic identifier for a cached TDH schema.
+///
+/// Assigned once on cache insertion and returned with every decoded event
+/// that matches the same schema.  Suitable as a `HashMap` key for
+/// exporter-side format registration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SchemaId(u64);
 
 /// Runtime decoder for TraceLogging / TraceLoggingDynamic ETW events.
 ///
@@ -198,6 +216,8 @@ pub struct TdhDecoder {
     cache: SchemaCache,
     /// Reusable aligned buffer for `TdhGetEventInformation` results.
     tei_buf: AlignedTeiBuf,
+    /// Monotonic counter for assigning unique `SchemaId`s.
+    next_schema_id: u64,
 }
 
 impl TdhDecoder {
@@ -206,16 +226,16 @@ impl TdhDecoder {
         Self {
             cache: SchemaCache::new(),
             tei_buf: AlignedTeiBuf::new(),
+            next_schema_id: 0,
         }
     }
 
     /// Decodes an `EVENT_RECORD` into a [`TdhDecodedEvent`].
     ///
     /// The returned [`TdhDecodedEvent`] contains the decoded
-    /// [`EventData`] together with `is_new_schema`, which is `true`
-    /// when this schema was seen for the first time (cache miss).
-    /// Exporters can use this flag to register the [`EventFormat`]
-    /// for a unique ID without checking on every event.
+    /// [`EventData`], the TraceLogging `event_name`, and a monotonic
+    /// [`SchemaId`] that exporters can use as a cheap lookup key for
+    /// format registration.
     pub fn decode<'a>(
         &'a mut self,
         record: &'a EVENT_RECORD,
@@ -223,20 +243,21 @@ impl TdhDecoder {
         let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
         let schema_tl_bytes = find_schema_tl(record)?;
 
-        let is_new_schema = if self.cache.get(schema_tl_bytes, is_32bit).is_none() {
+        if self.cache.get(schema_tl_bytes, is_32bit).is_none() {
             call_tdh_get_event_information(record, &mut self.tei_buf)?;
-            let schema = build_cached_schema(self.tei_buf.as_bytes(), is_32bit)?;
+            let mut schema = build_cached_schema(self.tei_buf.as_bytes(), is_32bit)?;
+            let id = self.next_schema_id;
+            self.next_schema_id = id.wrapping_add(1);
+            schema.schema_id = SchemaId(id);
             debug!(
                 event_name = %schema.event_name,
                 field_count = schema.format.fields().len(),
+                schema_id = id,
                 is_32bit,
                 "TDH schema cache miss — new schema cached"
             );
             self.cache.insert(schema_tl_bytes.to_vec(), is_32bit, schema);
-            true
-        } else {
-            false
-        };
+        }
 
         let schema = self.cache.get(schema_tl_bytes, is_32bit)
             .expect("just inserted");
@@ -256,7 +277,7 @@ impl TdhDecoder {
         Ok(TdhDecodedEvent {
             event_data: EventData::new(user_data, user_data, &schema.format),
             event_name,
-            is_new_schema,
+            schema_id: schema.schema_id,
         })
     }
 }
@@ -287,6 +308,7 @@ fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, T
         return Ok(CachedSchema {
             event_name,
             format: EventFormat::new(),
+            schema_id: SchemaId(0), // assigned by caller
         });
     }
 
@@ -323,6 +345,7 @@ fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, T
     Ok(CachedSchema {
         event_name,
         format,
+        schema_id: SchemaId(0), // assigned by caller
     })
 }
 
@@ -785,7 +808,7 @@ mod tests {
 
         let mut decoder = TdhDecoder::new();
         let result = decoder.decode(&record).expect("decode should succeed");
-        assert!(result.is_new_schema);
+        let _schema_id = result.schema_id;
 
         let fields = result.event_data.format().fields();
         assert_eq!(fields.len(), 1);
@@ -941,14 +964,14 @@ mod tests {
 
         let mut decoder = TdhDecoder::new();
         let r1 = decoder.decode(&record_1).expect("first decode");
-        assert!(r1.is_new_schema);
+        let id1 = r1.schema_id;
         assert_eq!(r1.event_data.format().fields()[0].size, 4);
 
         let user_data_2 = 222u32.to_le_bytes();
         let mut ext_items_2: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
         let record_2 = build_test_record(prov, evt, &mut ext_items_2, &user_data_2);
         let r2 = decoder.decode(&record_2).expect("second decode (cached)");
-        assert!(!r2.is_new_schema);
+        assert_eq!(r2.schema_id, id1, "cache hit should return same SchemaId");
         assert_eq!(r2.event_data.format().fields()[0].size, 4);
     }
 
@@ -986,7 +1009,7 @@ mod tests {
 
         let mut decoder = TdhDecoder::new();
         let r64 = decoder.decode(&record_64).expect("64-bit decode");
-        assert!(r64.is_new_schema, "64-bit should be a cache miss");
+        let id_64 = r64.schema_id;
 
         // 32-bit decode (set EVENT_HEADER_FLAG_32_BIT_HEADER)
         let mut ext_items_32: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
@@ -994,19 +1017,20 @@ mod tests {
         record_32.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
 
         let r32 = decoder.decode(&record_32).expect("32-bit decode");
-        assert!(r32.is_new_schema, "32-bit should also be a cache miss (separate cache)");
+        let id_32 = r32.schema_id;
+        assert_ne!(id_64, id_32, "32-bit and 64-bit should get different SchemaIds");
 
-        // Second 64-bit decode should hit the 64-bit cache
+        // Second 64-bit decode should return the same SchemaId
         let mut ext_items_64b: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
         let record_64b = build_test_record(prov, evt, &mut ext_items_64b, &user_data);
         let r64b = decoder.decode(&record_64b).expect("64-bit cache hit");
-        assert!(!r64b.is_new_schema, "64-bit should be a cache hit");
+        assert_eq!(r64b.schema_id, id_64, "64-bit cache hit should return same ID");
 
-        // Second 32-bit decode should hit the 32-bit cache
+        // Second 32-bit decode should return the same SchemaId
         let mut ext_items_32b: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
         let mut record_32b = build_test_record(prov, evt, &mut ext_items_32b, &user_data);
         record_32b.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
         let r32b = decoder.decode(&record_32b).expect("32-bit cache hit");
-        assert!(!r32b.is_new_schema, "32-bit should be a cache hit");
+        assert_eq!(r32b.schema_id, id_32, "32-bit cache hit should return same ID");
     }
 }
