@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
+
 use tracing::{debug, info, trace, warn};
 
 use super::*;
@@ -1266,6 +1269,28 @@ impl PerfDataSource for RingBufDataSource {
         }
 
         self.enabled
+    }
+
+    #[cfg(target_os = "linux")]
+    fn perf_fds(&self) -> Vec<(u32, BorrowedFd<'_>)> {
+        /* Walk leader_ids in CPU order so consumers get a deterministic
+         * iteration order. Each leader's per-CPU ring is the one the
+         * kernel marks readable; non-leader event types redirect into
+         * the same ring via `PERF_EVENT_IOC_SET_OUTPUT`, so their fds are
+         * not separately wakeable and are intentionally not exposed. */
+        let mut cpus: Vec<u32> = self.leader_ids.keys().copied().collect();
+        cpus.sort_unstable();
+
+        let mut fds = Vec::with_capacity(cpus.len());
+        for cpu in cpus {
+            let leader_id = self.leader_ids[&cpu];
+            if let Some(buf) = self.ring_bufs.get(&leader_id) {
+                if let Some(fd) = buf.borrowed_fd() {
+                    fds.push((cpu, fd));
+                }
+            }
+        }
+        fds
     }
 
     fn take_in_process_writer(

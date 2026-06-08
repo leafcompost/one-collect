@@ -3,6 +3,8 @@
 
 use std::marker::PhantomData;
 use std::arch::asm;
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
 use std::rc::Rc;
 
 #[cfg(target_os = "linux")]
@@ -796,6 +798,17 @@ impl CpuRingBuf {
             cpu: self.cpu,
             attributes: self.attributes.clone(),
         }
+    }
+
+    /// Borrow the per-CPU perf fd for the lifetime of `self`.
+    ///
+    /// Returns `None` if the buffer has not been opened yet.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn borrowed_fd(&self) -> Option<BorrowedFd<'_>> {
+        /* SAFETY: `self.fd` is an open file descriptor for the lifetime
+         * of this `CpuRingBuf`. The returned `BorrowedFd` is tied to
+         * `&self` so the caller cannot outlive it. */
+        self.fd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) })
     }
 
     fn read_id(&self) -> IOResult<u64> {
