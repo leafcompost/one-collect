@@ -51,6 +51,16 @@ libc = "0.2.153"
 [dev-dependencies]
 criterion = "0.3"
 
+# Windows-only dev-deps used by the TDH decoder integration tests under
+# `tests/etw_tdh_integration.rs`. These crates emit real ETW TraceLogging
+# events through the live ETW runtime, which we then capture via
+# `EtwSession` and decode through `TdhDecoder`. Both are published to
+# crates.io by Microsoft so CI (which has no access to a local
+# TraceLogging checkout) can build the tests reproducibly.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+tracelogging = "1.2"
+tracelogging_dynamic = "1.2"
+
 [[bench]]
 name = "event"
 harness = false

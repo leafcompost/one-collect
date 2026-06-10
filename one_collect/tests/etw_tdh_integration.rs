@@ -1,0 +1,938 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! End-to-end integration tests for the runtime TDH decoder.
+//!
+//! These tests register a real TraceLogging ETW provider (using the
+//! `tracelogging` and `tracelogging_dynamic` crates), emit known events
+//! through ETW, capture them inside an [`EtwSession`], decode them with
+//! [`TdhDecoder`], and assert that the decoded field values match what
+//! was written.
+//!
+//! Both tests are marked `#[ignore]` because the consumer side of ETW
+//! requires administrative privileges (`SeSystemProfilePrivilege` /
+//! `SeDebugPrivilege`).  Run manually from an elevated shell with:
+//!
+//! ```text
+//! cargo test -p one_collect --test etw_tdh_integration -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! `--test-threads=1` is required: each test starts its own ETW kernel
+//! consumer session and registers the same TraceLogging provider GUID
+//! in this process.  Running the tests concurrently would race on those
+//! process- and system-global resources.
+
+#![cfg(target_os = "windows")]
+
+use std::cell::RefCell;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use one_collect::{Guid, Writable};
+use one_collect::etw::{EtwSession, LEVEL_VERBOSE};
+use one_collect::etw::tdh::TdhDecoder;
+use one_collect::event::Event;
+use one_collect::event::os::windows::WindowsEventExtension;
+
+use tracelogging as tlg;
+use tracelogging_dynamic as tld;
+
+// ── Test fixtures ────────────────────────────────────────────────────
+
+/// Keyword used by every event the tests emit (and the value the wide
+/// event subscribes to via `MatchAnyKeyword`).
+const TEST_KEYWORD: u64 = 0x1;
+
+/// Hard upper bound on a single test run — should never be reached when
+/// running on a healthy ETW subsystem.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Expected u32 value in "EventNumbers".
+///
+/// `0xDEADBEEF` is chosen deliberately: every byte is distinct and the
+/// value is asymmetric, so any byte-order or offset-by-one regression
+/// in the decoder will fail the assertion (a palindromic or
+/// repeated-byte constant could mask such bugs).  Do not change this
+/// value without keeping that property.
+const EXPECTED_U32: u32 = 0xDEADBEEF;
+/// Expected u64 value in "EventNumbers".
+///
+/// Chosen with the same byte-distinctness property as `EXPECTED_U32`
+/// (each byte 0x01..=0x08 is unique).
+const EXPECTED_U64: u64 = 0x0102_0304_0506_0708;
+/// Expected ANSI/UTF-8 string in "EventStrings".
+const EXPECTED_STR8: &str = "hello-from-tdh";
+/// Expected UTF-16 string in "EventStrings".
+const EXPECTED_STR16: &[u16] = &[
+    b'w' as u16, b'i' as u16, b'd' as u16, b'e' as u16,
+    b'-' as u16, b'w' as u16, b'o' as u16, b'r' as u16,
+    b'l' as u16, b'd' as u16,
+];
+
+/// Expected f32 (`InType::F32`) value in "EventScalars".
+const EXPECTED_F32: f32 = std::f32::consts::PI;
+/// Expected f64 (`InType::F64`) value in "EventScalars".
+const EXPECTED_F64: f64 = std::f64::consts::E;
+/// Expected bool8 (`InType::U8` + `OutType::Boolean`) value in "EventScalars".
+///
+/// TraceLogging encodes `true` as the byte `1` and `false` as `0`.
+const EXPECTED_BOOL8: u8 = 1;
+/// Expected FILETIME (`InType::FileTime`, 64-bit) value in "EventScalars".
+///
+/// 100-nanosecond intervals since 1601-01-01 UTC.  This value
+/// corresponds to a real-but-arbitrary timestamp in mid-2021 and is
+/// only used to verify byte-exact round-tripping.
+const EXPECTED_FILETIME: i64 = 132_580_056_000_000_000;
+/// Expected SYSTEMTIME (`InType::SystemTime`, 16-byte calendar form) value
+/// in "EventScalars".
+///
+/// On the wire SYSTEMTIME is **8 packed little-endian `u16` fields** in
+/// the order: `wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute,
+/// wSecond, wMilliseconds`.  The decoder does not validate calendar
+/// correctness — these bytes round-trip verbatim.
+const EXPECTED_SYSTEMTIME: [u16; 8] = [2021, 7, 1, 5, 12, 34, 56, 789];
+/// Expected GUID (`InType::Guid`, 16 bytes in Windows little-endian
+/// COM layout) value in "EventScalars".
+const EXPECTED_GUID: tlg::Guid = tlg::Guid::from_fields(
+    0xDEAD_BEEF,
+    0x1234,
+    0x5678,
+    [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+);
+
+/// Expected u32 value for the outer top-level field in "EventNested".
+const EXPECTED_NESTED_TOP: u32 = 100;
+/// Expected u32 value for the first inner-struct field in "EventNested".
+const EXPECTED_NESTED_INNER_A: u32 = 200;
+/// Expected u64 value for the second inner-struct field in "EventNested".
+const EXPECTED_NESTED_INNER_B: u64 = 300;
+/// Expected u32 value for the second top-level field in "EventNested".
+const EXPECTED_NESTED_BOTTOM: u32 = 400;
+
+/// A decoded event captured by the wide-event callback.
+struct CapturedEvent {
+    name: String,
+    field_names: Vec<String>,
+    field_types: Vec<String>,
+    payload: Vec<u8>,
+    format: one_collect::event::EventFormat,
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/// Converts a `tracelogging::Guid` into the framework's `one_collect::Guid`.
+///
+/// Both crates store the GUID using the same in-memory layout (Microsoft
+/// COM `DataN`-style fields), and their `to_u128`/`from_u128` helpers
+/// agree on bit positions, so a round trip through `u128` is the
+/// well-defined conversion.
+fn tlg_guid_to_oc(g: tlg::Guid) -> Guid {
+    Guid::from_u128(g.to_u128())
+}
+
+/// Builds an [`EtwSession`] configured to capture every event from
+/// `provider_guid` and run `on_decoded` for each successful TDH decode.
+///
+/// Returns the session ready to be parsed by [`EtwSession::parse_until`].
+fn build_capturing_session<F>(
+    provider_guid: Guid,
+    wide_name: &str,
+    mut on_decoded: F,
+) -> EtwSession
+where
+    F: FnMut(&one_collect::etw::tdh::TdhDecodedEvent<'_>) + 'static,
+{
+    let mut session = EtwSession::new();
+    let ancillary = session.ancillary_data();
+    let decoder = Rc::new(RefCell::new(TdhDecoder::new()));
+
+    let mut event = Event::for_etw(
+        0,
+        wide_name.to_string(),
+        provider_guid,
+        LEVEL_VERBOSE,
+        // MatchAnyKeyword — capture every keyword bit this provider uses.
+        u64::MAX,
+    );
+
+    event.set_id_wild_card_flag();
+
+    event.add_callback(move |_data| {
+        let ancillary_ref = ancillary.borrow();
+        let record = match ancillary_ref.record() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let mut decoder = decoder.borrow_mut();
+
+        // TraceLogging providers shouldn't emit non-TraceLogging events,
+        // but be defensive: don't fail the session callback on a stray
+        // decode error (that would propagate and stop processing for
+        // every subsequent event).  Surface it via `eprintln!` so it's
+        // still visible in `--nocapture` output for debugging.
+        match decoder.decode(record) {
+            Ok(decoded) => on_decoded(&decoded),
+            Err(e) => eprintln!("WARN: TDH decode failed for a record: {e:?}"),
+        }
+
+        Ok(())
+    });
+
+    session.add_event(event, None);
+    session
+}
+
+/// Builds the captured-events sink, an event counter, and the callback
+/// that drives both.
+///
+/// The sink is a `Writable<Vec<CapturedEvent>>` (which is `Rc`-based and
+/// therefore single-threaded) — that is safe because the wide-event
+/// callback runs on the same thread as `EtwSession::parse_until` (the
+/// test thread).
+///
+/// The counter is a cross-thread atomic shared with the `parse_until`
+/// predicate, which runs on the parse worker thread.
+fn make_capture_sink() -> (
+    Writable<Vec<CapturedEvent>>,
+    Arc<AtomicUsize>,
+    impl FnMut(&one_collect::etw::tdh::TdhDecodedEvent<'_>) + 'static,
+) {
+    let captured: Writable<Vec<CapturedEvent>> = Writable::new(Vec::new());
+    let counter = Arc::new(AtomicUsize::new(0));
+    let captured_for_cb = captured.clone();
+    let counter_for_cb = counter.clone();
+
+    let callback = move |decoded: &one_collect::etw::tdh::TdhDecodedEvent<'_>| {
+        let name = decoded.event_name.unwrap_or("").to_string();
+        let format = decoded.event_data.format();
+
+        // Snapshot the schema + raw payload bytes so we can assert on
+        // them after `parse_until` returns and the original `EVENT_RECORD`
+        // is long gone.
+        let field_names: Vec<String> =
+            format.fields().iter().map(|f| f.name.clone()).collect();
+        let field_types: Vec<String> =
+            format.fields().iter().map(|f| f.type_name.clone()).collect();
+        let payload = decoded.event_data.event_data().to_vec();
+        let format_clone = format.clone();
+
+        captured_for_cb.borrow_mut().push(CapturedEvent {
+            name,
+            field_names,
+            field_types,
+            payload,
+            format: format_clone,
+        });
+        counter_for_cb.fetch_add(1, Ordering::Relaxed);
+    };
+
+    (captured, counter, callback)
+}
+
+/// Polls `is_enabled` every 10 ms until it returns `true` or
+/// `TEST_TIMEOUT` elapses.  On timeout, logs a `WARN` so the resulting
+/// 0-event capture failure has an obvious explanation.
+///
+/// `what` is a short label used only in the warning message.
+fn wait_until_enabled(what: &str, is_enabled: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !is_enabled() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "WARN: {what} never became enabled — \
+                 the test will fail at assertion time"
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Returns the index of the first captured event with the given name.
+/// Panics with a descriptive message if no such event exists.
+fn find_event<'a>(
+    captured: &'a [CapturedEvent],
+    name: &str,
+) -> &'a CapturedEvent {
+    captured
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| {
+            let names: Vec<&str> =
+                captured.iter().map(|e| e.name.as_str()).collect();
+            panic!(
+                "expected to capture an event named {name:?}, but only saw {names:?}"
+            );
+        })
+}
+
+/// Runs `session` until `expected` events have been captured (or
+/// `TEST_TIMEOUT` elapses), then asserts the minimum count and returns a
+/// borrowed snapshot of the captured events.
+///
+/// Centralises the `parse_until` + deadline + minimum-count assertion
+/// pattern shared by every test in this file.  Takes `session` by value
+/// because [`EtwSession::parse_until`] consumes `self`.
+fn drive_to_completion<'a>(
+    session: EtwSession,
+    session_name: &str,
+    captured: &'a Writable<Vec<CapturedEvent>>,
+    counter: Arc<AtomicUsize>,
+    expected: usize,
+) -> std::cell::Ref<'a, Vec<CapturedEvent>> {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    session
+        .parse_until(session_name, move || {
+            counter.load(Ordering::Relaxed) >= expected
+                || Instant::now() >= deadline
+        })
+        .expect("parse_until failed (is the test running elevated?)");
+
+    let snapshot = captured.borrow();
+    assert!(
+        snapshot.len() >= expected,
+        "expected at least {expected} captured events, got {} ({:?})",
+        snapshot.len(),
+        snapshot.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    snapshot
+}
+
+/// Asserts the captured event has exactly the given field names and
+/// type-names in the given order.
+///
+/// Compares as `&str` slices so call sites don't have to write
+/// `vec!["X".to_string(), ...]`.
+fn assert_schema(
+    event: &CapturedEvent,
+    expected_names: &[&str],
+    expected_types: &[&str],
+    ctx: &str,
+) {
+    let actual_names: Vec<&str> =
+        event.field_names.iter().map(|s| s.as_str()).collect();
+    let actual_types: Vec<&str> =
+        event.field_types.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        actual_names, expected_names,
+        "{ctx} field-name layout"
+    );
+    assert_eq!(
+        actual_types, expected_types,
+        "{ctx} field-type layout"
+    );
+}
+
+/// Reads exactly `N` raw bytes from the named field, panicking with a
+/// clear message if the field is missing or has a different on-wire
+/// length.  Used for fixed-size in-types that have no typed accessor
+/// on `EventFormat` (f32, f64, SYSTEMTIME, GUID, ...).
+fn read_fixed<const N: usize>(
+    event: &CapturedEvent,
+    name: &str,
+) -> [u8; N] {
+    let field_ref = event.format.get_field_ref(name)
+        .unwrap_or_else(|| panic!("{name} field should exist"));
+    let bytes = event.format.get_data(field_ref, &event.payload);
+    bytes.try_into().unwrap_or_else(|_| {
+        panic!("{name} field should be {N} bytes, got {}", bytes.len())
+    })
+}
+
+/// Asserts every field value in an "EventNumbers" event matches the
+/// constants written by the producer.
+fn assert_numbers_event(event: &CapturedEvent) {
+    assert_schema(
+        event,
+        &["Count", "BigCount"],
+        &["u32", "u64"],
+        "numbers event",
+    );
+
+    let count_ref = event.format.get_field_ref("Count")
+        .expect("Count field should exist");
+    let big_ref = event.format.get_field_ref("BigCount")
+        .expect("BigCount field should exist");
+
+    let count = event.format.get_u32(count_ref, &event.payload)
+        .expect("Count should decode as u32");
+    let big_count = event.format.get_u64(big_ref, &event.payload)
+        .expect("BigCount should decode as u64");
+
+    assert_eq!(count, EXPECTED_U32, "u32 field round-trip mismatch");
+    assert_eq!(big_count, EXPECTED_U64, "u64 field round-trip mismatch");
+}
+
+/// Asserts every field value in an "EventStrings" event matches the
+/// constants written by the producer.
+///
+/// "Message" is a TraceLogging *counted* ANSI string (str8), which the
+/// TDH decoder maps to `LocationType::StaticLenPrefixArray` with a
+/// 2-byte length prefix.  "Name" is a *null-terminated* UTF-16 string
+/// (cstr16), which maps to `LocationType::StaticUTF16String`.
+fn assert_strings_event(event: &CapturedEvent) {
+    assert_schema(
+        event,
+        &["Message", "Name"],
+        &["counted_string", "wstring"],
+        "strings event",
+    );
+
+    let mut get_message = event.format
+        .try_get_field_data_closure("Message")
+        .expect("Message accessor should exist");
+    let mut get_name = event.format
+        .try_get_field_data_closure("Name")
+        .expect("Name accessor should exist");
+
+    assert_eq!(
+        get_message(&event.payload),
+        EXPECTED_STR8.as_bytes(),
+        "ANSI counted string round-trip mismatch"
+    );
+
+    // UTF-16 fields are returned as raw little-endian bytes (excluding
+    // the trailing NUL).  Decode to verify code units round-trip.
+    let name_bytes = get_name(&event.payload);
+    assert_eq!(
+        name_bytes.len(),
+        EXPECTED_STR16.len() * 2,
+        "UTF-16 byte length mismatch"
+    );
+    let name_units: Vec<u16> = name_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(
+        name_units, EXPECTED_STR16,
+        "UTF-16 code units round-trip mismatch"
+    );
+}
+
+/// Asserts every field value in an "EventScalars" event matches the
+/// constants written by the producer.
+///
+/// Exercises the six fixed-size in-types not covered by the integer
+/// tests:
+///
+/// * `f32` → `TDH_INTYPE_FLOAT`  → `("float",  Static, 4)`
+/// * `f64` → `TDH_INTYPE_DOUBLE` → `("double", Static, 8)`
+/// * `bool8` (TLG `InType::U8` + `OutType::Boolean`) → `TDH_INTYPE_UINT8`
+///   → `("u8", Static, 1)` (TLG encodes `bool8` as a 1-byte integer with
+///   a `Boolean` out-type hint, so it shares the `u8` decoder path)
+/// * `filetime`   → `TDH_INTYPE_FILETIME`   → `("filetime",   Static, 8)`
+/// * `systemtime` → `TDH_INTYPE_SYSTEMTIME` → `("systemtime", Static, 16)`
+/// * `guid`       → `TDH_INTYPE_GUID`       → `("guid",       Static, 16)`
+fn assert_scalars_event(event: &CapturedEvent) {
+    assert_schema(
+        event,
+        &["Pi", "E", "Flag", "Created", "When", "Id"],
+        &["float", "double", "u8", "filetime", "systemtime", "guid"],
+        "scalars event",
+    );
+
+    // f32 / f64 — read raw bytes and decode manually since `EventFormat`
+    // does not expose typed float accessors.  `read_fixed` enforces the
+    // 4/8-byte on-wire length.
+    let pi = f32::from_le_bytes(read_fixed::<4>(event, "Pi"));
+    assert_eq!(
+        pi.to_bits(), EXPECTED_F32.to_bits(),
+        "f32 field round-trip mismatch (exact bit pattern)"
+    );
+    let e = f64::from_le_bytes(read_fixed::<8>(event, "E"));
+    assert_eq!(
+        e.to_bits(), EXPECTED_F64.to_bits(),
+        "f64 field round-trip mismatch (exact bit pattern)"
+    );
+
+    // bool8 — single byte, 0 = false, 1 = true.
+    let flag_ref = event.format.get_field_ref("Flag")
+        .expect("Flag field should exist");
+    let flag = event.format.get_u8(flag_ref, &event.payload)
+        .expect("Flag should decode as u8");
+    assert_eq!(flag, EXPECTED_BOOL8, "bool8 field round-trip mismatch");
+
+    // FILETIME — signed 64-bit integer, little-endian on the wire.
+    let created = i64::from_le_bytes(read_fixed::<8>(event, "Created"));
+    assert_eq!(
+        created, EXPECTED_FILETIME,
+        "FILETIME field round-trip mismatch"
+    );
+
+    // SYSTEMTIME — 8 packed little-endian u16 fields (16 bytes total).
+    let when_bytes = read_fixed::<16>(event, "When");
+    let when_units: [u16; 8] = std::array::from_fn(|i| {
+        u16::from_le_bytes([when_bytes[2 * i], when_bytes[2 * i + 1]])
+    });
+    assert_eq!(
+        when_units, EXPECTED_SYSTEMTIME,
+        "SYSTEMTIME field round-trip mismatch"
+    );
+
+    // GUID — 16 bytes in Windows little-endian COM layout.
+    assert_eq!(
+        read_fixed::<16>(event, "Id"),
+        EXPECTED_GUID.to_bytes_le(),
+        "GUID field round-trip mismatch"
+    );
+}
+
+/// Asserts every field value in an "EventNested" event matches the
+/// constants written by the producer.
+///
+/// Verifies the decoder's struct-flattening behavior:
+///
+/// * The struct property itself is **not** emitted as a field.
+/// * Inner field names are **qualified with the outer struct name**
+///   using dot notation (e.g. `"Inner.InnerA"`).
+/// * Top-level fields outside the struct keep their bare names.
+/// * The four fields appear in declaration order in the flat field list.
+fn assert_nested_event(event: &CapturedEvent) {
+    assert_schema(
+        event,
+        &["Top", "Inner.InnerA", "Inner.InnerB", "Bottom"],
+        &["u32", "u32", "u64", "u32"],
+        "nested event",
+    );
+
+    // Resolve dotted-name field references and verify each scalar.
+    let top_ref = event.format.get_field_ref("Top")
+        .expect("Top field should exist");
+    let inner_a_ref = event.format.get_field_ref("Inner.InnerA")
+        .expect("Inner.InnerA field should exist (dot notation)");
+    let inner_b_ref = event.format.get_field_ref("Inner.InnerB")
+        .expect("Inner.InnerB field should exist (dot notation)");
+    let bottom_ref = event.format.get_field_ref("Bottom")
+        .expect("Bottom field should exist");
+
+    let top = event.format.get_u32(top_ref, &event.payload)
+        .expect("Top should decode as u32");
+    let inner_a = event.format.get_u32(inner_a_ref, &event.payload)
+        .expect("Inner.InnerA should decode as u32");
+    let inner_b = event.format.get_u64(inner_b_ref, &event.payload)
+        .expect("Inner.InnerB should decode as u64");
+    let bottom = event.format.get_u32(bottom_ref, &event.payload)
+        .expect("Bottom should decode as u32");
+
+    assert_eq!(top, EXPECTED_NESTED_TOP, "Top round-trip mismatch");
+    assert_eq!(
+        inner_a, EXPECTED_NESTED_INNER_A,
+        "Inner.InnerA round-trip mismatch"
+    );
+    assert_eq!(
+        inner_b, EXPECTED_NESTED_INNER_B,
+        "Inner.InnerB round-trip mismatch"
+    );
+    assert_eq!(
+        bottom, EXPECTED_NESTED_BOTTOM,
+        "Bottom round-trip mismatch"
+    );
+}
+
+// ── Test A: tracelogging_dynamic (runtime-defined provider) ──────────
+
+/// Verifies the TDH decoder produces correct field values for events
+/// emitted by the runtime-schema `tracelogging_dynamic` crate.
+#[ignore]
+#[test]
+fn tdh_decodes_tracelogging_dynamic_events() {
+    let provider_name = "OneCollect.TdhIntegration.Dynamic";
+    let provider_guid = tlg_guid_to_oc(tld::Provider::guid_from_name(provider_name));
+
+    // `Provider` is `!Unpin` (it stores an async ETW callback) so it
+    // must live at a stable address from `register` to `unregister`.
+    // Leaking onto the heap pins it for the lifetime of the test
+    // process — which is fine for a test: the OS unregisters on exit.
+    let provider: &'static tld::Provider = Box::leak(Box::new(
+        tld::Provider::new(provider_name, &tld::Provider::options()),
+    ));
+    unsafe {
+        Pin::new_unchecked(provider).register();
+    }
+
+    let (captured, counter, callback) = make_capture_sink();
+
+    let mut session = build_capturing_session(
+        provider_guid,
+        "OneCollect.TdhIntegration.Dynamic.Wide",
+        callback,
+    );
+
+    // Spawn the event writer once the session is up and our provider
+    // has been enabled.  `started_callback` is invoked on the parse
+    // worker thread *after* `EnableTraceEx2` returns for our provider,
+    // so a writer that polls `provider.enabled()` is guaranteed to
+    // make progress.
+    //
+    // Events emitted by this test (all under keyword `TEST_KEYWORD`):
+    //
+    //   EventNumbers
+    //       Count    : u32       = EXPECTED_U32       (0xDEADBEEF)
+    //       BigCount : u64       = EXPECTED_U64       (0x01020304_05060708)
+    //
+    //   EventStrings
+    //       Message  : str8      = EXPECTED_STR8      ("hello-from-tdh")
+    //       Name     : cstr16    = EXPECTED_STR16     (UTF-16 "wide-world")
+    //
+    //   EventScalars
+    //       Pi       : f32       = EXPECTED_F32       (π)
+    //       E        : f64       = EXPECTED_F64       (e)
+    //       Flag     : bool8     = EXPECTED_BOOL8     (true → 0x01)
+    //       Created  : FILETIME  = EXPECTED_FILETIME  (i64, 100 ns since 1601)
+    //       When     : SYSTEMTIME= EXPECTED_SYSTEMTIME([u16; 8] calendar form)
+    //       Id       : GUID      = EXPECTED_GUID      (16-byte COM layout)
+    session.add_started_callback(move |_ctx| {
+        std::thread::spawn(move || {
+            if !wait_until_enabled("dynamic provider", || {
+                provider.enabled(tlg::Level::Verbose, TEST_KEYWORD)
+            }) {
+                return;
+            }
+
+            let mut builder = tld::EventBuilder::new();
+
+            // EventNumbers: u32 + u64.
+            builder
+                .reset("EventNumbers", tlg::Level::Verbose, TEST_KEYWORD, 0)
+                .add_u32("Count", EXPECTED_U32, tlg::OutType::Default, 0)
+                .add_u64("BigCount", EXPECTED_U64, tlg::OutType::Default, 0)
+                .write(provider, None, None);
+
+            // EventStrings: counted ANSI + null-terminated UTF-16.
+            builder
+                .reset("EventStrings", tlg::Level::Verbose, TEST_KEYWORD, 0)
+                .add_str8(
+                    "Message",
+                    EXPECTED_STR8.as_bytes(),
+                    tlg::OutType::Default,
+                    0,
+                )
+                .add_cstr16("Name", EXPECTED_STR16, tlg::OutType::Default, 0)
+                .write(provider, None, None);
+
+            // EventScalars: f32 + f64 + bool8 + FILETIME + SYSTEMTIME + GUID.
+            //
+            // `add_u8(name, value, OutType::Boolean, 0)` is the dynamic
+            // equivalent of the static `bool8(name, &val)` macro keyword:
+            // both produce `InType::U8` with `OutType::Boolean`.
+            builder
+                .reset("EventScalars", tlg::Level::Verbose, TEST_KEYWORD, 0)
+                .add_f32("Pi", EXPECTED_F32, tlg::OutType::Default, 0)
+                .add_f64("E", EXPECTED_F64, tlg::OutType::Default, 0)
+                .add_u8("Flag", EXPECTED_BOOL8, tlg::OutType::Boolean, 0)
+                .add_filetime(
+                    "Created",
+                    EXPECTED_FILETIME,
+                    tlg::OutType::Default,
+                    0,
+                )
+                .add_systemtime(
+                    "When",
+                    &EXPECTED_SYSTEMTIME,
+                    tlg::OutType::Default,
+                    0,
+                )
+                .add_guid("Id", &EXPECTED_GUID, tlg::OutType::Default, 0)
+                .write(provider, None, None);
+        });
+    });
+
+    let captured = drive_to_completion(
+        session,
+        "one_collect_tdh_dynamic",
+        &captured,
+        counter,
+        3,
+    );
+
+    assert_numbers_event(find_event(&captured, "EventNumbers"));
+    assert_strings_event(find_event(&captured, "EventStrings"));
+    assert_scalars_event(find_event(&captured, "EventScalars"));
+}
+
+// ── Test B: tracelogging (compile-time provider via macros) ──────────
+
+tlg::define_provider!(STATIC_PROV, "OneCollect.TdhIntegration.Static");
+
+/// Verifies the TDH decoder produces correct field values for events
+/// emitted by the compile-time-schema `tracelogging` crate.
+#[ignore]
+#[test]
+fn tdh_decodes_tracelogging_static_events() {
+    // Provider GUID is `Guid::from_name(provider_name)` for both
+    // crates when no explicit id() is supplied to define_provider!.
+    let provider_guid = tlg_guid_to_oc(
+        tlg::Guid::from_name("OneCollect.TdhIntegration.Static"),
+    );
+
+    // SAFETY: `STATIC_PROV` is a true `'static` item, so it lives at a
+    // fixed address forever — the pinning requirement of
+    // `Provider::register` is trivially satisfied.  The OS unregisters
+    // automatically on process exit.
+    unsafe {
+        STATIC_PROV.register();
+    }
+
+    let (captured, counter, callback) = make_capture_sink();
+
+    let mut session = build_capturing_session(
+        provider_guid,
+        "OneCollect.TdhIntegration.Static.Wide",
+        callback,
+    );
+
+    // Events emitted by this test (mirror of the dynamic test, but
+    // written through the compile-time-schema `tracelogging` crate):
+    //
+    //   EventNumbers
+    //       Count    : u32       = EXPECTED_U32       (0xDEADBEEF)
+    //       BigCount : u64       = EXPECTED_U64       (0x01020304_05060708)
+    //
+    //   EventStrings
+    //       Message  : str8      = EXPECTED_STR8      ("hello-from-tdh")
+    //       Name     : cstr16    = EXPECTED_STR16     (UTF-16 "wide-world")
+    //
+    //   EventScalars
+    //       Pi       : f32       = EXPECTED_F32       (π)
+    //       E        : f64       = EXPECTED_F64       (e)
+    //       Flag     : bool8     = true               (TLG `bool8` keyword)
+    //       Created  : FILETIME  = EXPECTED_FILETIME  (i64, 100 ns since 1601)
+    //       When     : SYSTEMTIME= EXPECTED_SYSTEMTIME([u16; 8] calendar form)
+    //       Id       : GUID      = EXPECTED_GUID      (16-byte COM layout)
+    session.add_started_callback(move |_ctx| {
+        std::thread::spawn(move || {
+            if !wait_until_enabled("static provider", || {
+                STATIC_PROV.enabled(tlg::Level::Verbose, TEST_KEYWORD)
+            }) {
+                return;
+            }
+
+            // EventNumbers: u32 + u64.
+            let _ = tlg::write_event!(
+                STATIC_PROV,
+                "EventNumbers",
+                level(Verbose),
+                keyword(TEST_KEYWORD),
+                u32("Count", &EXPECTED_U32),
+                u64("BigCount", &EXPECTED_U64),
+            );
+
+            // EventStrings: counted ANSI + null-terminated UTF-16.
+            let _ = tlg::write_event!(
+                STATIC_PROV,
+                "EventStrings",
+                level(Verbose),
+                keyword(TEST_KEYWORD),
+                str8("Message", EXPECTED_STR8),
+                cstr16("Name", EXPECTED_STR16),
+            );
+
+            // EventScalars: f32 + f64 + bool8 + FILETIME + SYSTEMTIME + GUID.
+            //
+            // The `bool8` macro keyword is the static crate's name for
+            // `InType::U8` + `OutType::Boolean`; `win_filetime` is its
+            // name for `InType::FileTime` from a raw `i64`; and
+            // `win_systemtime` is the 16-byte `InType::SystemTime` from
+            // an `&[u16; 8]` (the static `systemtime` keyword, despite
+            // its name, actually emits an 8-byte FILETIME).
+            let _ = tlg::write_event!(
+                STATIC_PROV,
+                "EventScalars",
+                level(Verbose),
+                keyword(TEST_KEYWORD),
+                f32("Pi", &EXPECTED_F32),
+                f64("E", &EXPECTED_F64),
+                bool8("Flag", &true),
+                win_filetime("Created", &EXPECTED_FILETIME),
+                win_systemtime("When", &EXPECTED_SYSTEMTIME),
+                guid("Id", &EXPECTED_GUID),
+            );
+        });
+    });
+
+    let captured = drive_to_completion(
+        session,
+        "one_collect_tdh_static",
+        &captured,
+        counter,
+        3,
+    );
+
+    assert_numbers_event(find_event(&captured, "EventNumbers"));
+    assert_strings_event(find_event(&captured, "EventStrings"));
+    assert_scalars_event(find_event(&captured, "EventScalars"));
+}
+
+// ── Test C: nested struct (dynamic) ──────────────────────────────────
+
+/// Verifies the TDH decoder flattens nested TraceLogging structs into
+/// dot-notation field names when emitted from the runtime-schema
+/// `tracelogging_dynamic` crate.
+#[ignore]
+#[test]
+fn tdh_decodes_tracelogging_dynamic_nested_struct() {
+    let provider_name = "OneCollect.TdhIntegration.Dynamic.Struct";
+    let provider_guid = tlg_guid_to_oc(tld::Provider::guid_from_name(provider_name));
+
+    let provider: &'static tld::Provider = Box::leak(Box::new(
+        tld::Provider::new(provider_name, &tld::Provider::options()),
+    ));
+    unsafe {
+        Pin::new_unchecked(provider).register();
+    }
+
+    let (captured, counter, callback) = make_capture_sink();
+
+    let mut session = build_capturing_session(
+        provider_guid,
+        "OneCollect.TdhIntegration.Dynamic.Struct.Wide",
+        callback,
+    );
+
+    // Events emitted by this test (a single event with a nested struct):
+    //
+    //   EventNested
+    //       Top          : u32   = EXPECTED_NESTED_TOP      (100)   — outer
+    //       Inner.InnerA : u32   = EXPECTED_NESTED_INNER_A  (200)   — nested
+    //       Inner.InnerB : u64   = EXPECTED_NESTED_INNER_B  (300)   — nested
+    //       Bottom       : u32   = EXPECTED_NESTED_BOTTOM   (400)   — outer
+    //
+    // The TDH decoder is expected to flatten the `Inner` struct into
+    // dot-prefixed field names (`Inner.InnerA`, `Inner.InnerB`) and
+    // omit the struct property itself from the field list.
+    session.add_started_callback(move |_ctx| {
+        std::thread::spawn(move || {
+            if !wait_until_enabled("dynamic struct provider", || {
+                provider.enabled(tlg::Level::Verbose, TEST_KEYWORD)
+            }) {
+                return;
+            }
+
+            // EventNested layout:
+            //
+            //     u32  Top
+            //     struct Inner {
+            //         u32  InnerA
+            //         u64  InnerB
+            //     }
+            //     u32  Bottom
+            //
+            // `add_struct("Inner", 2, 0)` declares that the *next 2*
+            // added fields are members of the `Inner` struct; the field
+            // after that returns to the outer scope.
+            let mut builder = tld::EventBuilder::new();
+            builder
+                .reset("EventNested", tlg::Level::Verbose, TEST_KEYWORD, 0)
+                .add_u32("Top", EXPECTED_NESTED_TOP, tlg::OutType::Default, 0)
+                .add_struct("Inner", 2, 0)
+                .add_u32(
+                    "InnerA",
+                    EXPECTED_NESTED_INNER_A,
+                    tlg::OutType::Default,
+                    0,
+                )
+                .add_u64(
+                    "InnerB",
+                    EXPECTED_NESTED_INNER_B,
+                    tlg::OutType::Default,
+                    0,
+                )
+                .add_u32(
+                    "Bottom",
+                    EXPECTED_NESTED_BOTTOM,
+                    tlg::OutType::Default,
+                    0,
+                )
+                .write(provider, None, None);
+        });
+    });
+
+    let captured = drive_to_completion(
+        session,
+        "one_collect_tdh_dynamic_struct",
+        &captured,
+        counter,
+        1,
+    );
+
+    assert_nested_event(find_event(&captured, "EventNested"));
+}
+
+// ── Test D: nested struct (static) ───────────────────────────────────
+
+tlg::define_provider!(
+    STATIC_STRUCT_PROV,
+    "OneCollect.TdhIntegration.Static.Struct"
+);
+
+/// Verifies the TDH decoder flattens nested TraceLogging structs into
+/// dot-notation field names when emitted from the compile-time-schema
+/// `tracelogging` crate.
+#[ignore]
+#[test]
+fn tdh_decodes_tracelogging_static_nested_struct() {
+    let provider_guid = tlg_guid_to_oc(
+        tlg::Guid::from_name("OneCollect.TdhIntegration.Static.Struct"),
+    );
+
+    unsafe {
+        STATIC_STRUCT_PROV.register();
+    }
+
+    let (captured, counter, callback) = make_capture_sink();
+
+    let mut session = build_capturing_session(
+        provider_guid,
+        "OneCollect.TdhIntegration.Static.Struct.Wide",
+        callback,
+    );
+
+    // Events emitted by this test (mirror of the dynamic struct test,
+    // but written through the compile-time-schema `tracelogging` crate):
+    //
+    //   EventNested
+    //       Top          : u32   = EXPECTED_NESTED_TOP      (100)   — outer
+    //       Inner.InnerA : u32   = EXPECTED_NESTED_INNER_A  (200)   — nested
+    //       Inner.InnerB : u64   = EXPECTED_NESTED_INNER_B  (300)   — nested
+    //       Bottom       : u32   = EXPECTED_NESTED_BOTTOM   (400)   — outer
+    session.add_started_callback(move |_ctx| {
+        std::thread::spawn(move || {
+            if !wait_until_enabled("static struct provider", || {
+                STATIC_STRUCT_PROV.enabled(tlg::Level::Verbose, TEST_KEYWORD)
+            }) {
+                return;
+            }
+
+            // The `struct(name, { ... })` macro syntax automatically
+            // counts the nested members — no explicit field count is
+            // required, unlike the dynamic crate's `add_struct`.
+            let _ = tlg::write_event!(
+                STATIC_STRUCT_PROV,
+                "EventNested",
+                level(Verbose),
+                keyword(TEST_KEYWORD),
+                u32("Top", &EXPECTED_NESTED_TOP),
+                struct("Inner", {
+                    u32("InnerA", &EXPECTED_NESTED_INNER_A),
+                    u64("InnerB", &EXPECTED_NESTED_INNER_B),
+                }),
+                u32("Bottom", &EXPECTED_NESTED_BOTTOM),
+            );
+        });
+    });
+
+    let captured = drive_to_completion(
+        session,
+        "one_collect_tdh_static_struct",
+        &captured,
+        counter,
+        1,
+    );
+
+    assert_nested_event(find_event(&captured, "EventNested"));
+}

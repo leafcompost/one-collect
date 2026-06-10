@@ -489,6 +489,8 @@ dependencies = [
  "rhai",
  "ruwind",
  "sha1",
+ "tracelogging",
+ "tracelogging_dynamic",
  "tracing",
  "twox-hash",
  "windows-sys",
@@ -884,6 +886,30 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "tracelogging"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0015caf14cad7613b7bbbb9ee44399ad9a694307be545d8af4e2711178e547e"
+dependencies = [
+ "tracelogging_macros",
+]
+
+[[package]]
+name = "tracelogging_dynamic"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81357ee826ff21547ab41ceea8a4fcf58d60681de2055e65bc704c32e6e3614b"
+dependencies = [
+ "tracelogging",
+]
+
+[[package]]
+name = "tracelogging_macros"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95e2d891464ff33bc1814c4cbbb251bae7800458b1efdb6ac8b7c01ee6382563"
 
 [[package]]
 name = "tracing"
